@@ -18,6 +18,8 @@ use std::path::Path;
 use serde_json::Value;
 use std::str::FromStr;
 
+use crate::tokenizer_encoding::{IlluminaTokenizer, ReadNameAnalyzer, ReadNamePattern};
+
 pub(crate) struct BlockInfo {
     pub numitems: u32,
     pub uncompr_size: usize,

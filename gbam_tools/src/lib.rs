@@ -45,6 +45,7 @@ pub mod meta;
 mod stats;
 /// GBAM writer
 pub mod writer;
+pub mod tokenizer_encoding;
 
 // use self::writer::Writer;
 // pub use {ParsingTemplate, Reader};

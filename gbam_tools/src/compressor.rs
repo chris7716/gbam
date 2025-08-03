@@ -20,6 +20,8 @@ use std::fs::File;
 use lzzzz::lz4;
 use xz2::write::XzEncoder;
 
+use crate::tokenizer_encoding::{IlluminaTokenizer, ReadNameAnalyzer, ReadNamePattern, ByteUtils, PostTokenizationCompressor, PostTokenizationConfig};
+
 
 pub(crate) enum OrderingKey {
     Key(u64),
@@ -88,18 +90,128 @@ impl Compressor {
             rayon::spawn(move || {
                 let mut buf = buf_queue_rx.recv().unwrap();
                 buf.clear();
-                let compr_data = compress(&data[..block_info.uncompr_size], buf, block_info.codec);
+                
+                let compr_data = if block_info.field == Fields::ReadName {
+                    // Extract read names from the block for tokenization testing
+                    let mut read_name_refs = Vec::new();
+                    let mut offset = 0;
+                    
+                    // Parse read names from the block (assuming null-terminated strings)
+                    while offset < block_info.uncompr_size {
+                        if let Some(null_pos) = data[offset..block_info.uncompr_size].iter().position(|&b| b == 0) {
+                            let read_name = &data[offset..offset + null_pos];
+                            if !read_name.is_empty() {
+                                read_name_refs.push(read_name);
+                            }
+                            offset += null_pos + 1;
+                        } else {
+                            if offset < block_info.uncompr_size {
+                                read_name_refs.push(&data[offset..block_info.uncompr_size]);
+                            }
+                            break;
+                        }
+                    }
+                
+                    // Test tokenization if we have read names
+                    if !read_name_refs.is_empty() {
+                        if ReadNameAnalyzer::should_tokenize(&read_name_refs) {
+                            println!("Tokenizing read names...");
+                            
+                            let mut tokenizer = IlluminaTokenizer::new();
+                            match tokenizer.tokenize_batch(&read_name_refs) {
+                                Ok(tokenized) => {
+                                    println!("Tokenization successful! Applying post-tokenization compression...");
+                                    
+                                    // Apply post-tokenization compression pipeline
+                                    let post_compressor = PostTokenizationCompressor::new(
+                                        PostTokenizationConfig::default()
+                                    );
+                                    
+                                    match post_compressor.compress_tokenized_data(&tokenized, tokenizer.get_dictionary()) {
+                                        Ok(compressed_data) => {
+                                            let original_total_size: usize = read_name_refs.iter().map(|name| name.len()).sum();
+                                            
+                                            println!("\n=== Post-Tokenization Compression Results ===");
+                                            println!("Original block size: {} bytes", block_info.uncompr_size);
+                                            println!("Original read names total: {} bytes", original_total_size);
+                                            println!("Post-tokenization compressed size: {} bytes", compressed_data.len());
+                                            println!("Final compression ratio: {:.2}x", original_total_size as f64 / compressed_data.len() as f64);
+                                            println!("Space saved: {:.1}%", 
+                                                     (1.0 - compressed_data.len() as f64 / original_total_size as f64) * 100.0);
+                                            
+                                            compressed_data
+                                        }
+                                        Err(e) => {
+                                            eprintln!("Post-tokenization compression failed: {}, falling back", e);
+                                            
+                                            // Fallback to simple tokenization + basic compression
+                                            let mut encoded_data = Vec::new();
+                                            
+                                            // Serialize dictionary
+                                            let serialized_dict = tokenizer.serialize_dictionary();
+                                            encoded_data.extend_from_slice(&(serialized_dict.len() as u32).to_le_bytes());
+                                            encoded_data.extend_from_slice(&serialized_dict);
+                                            
+                                            // Serialize tokenized data
+                                            encoded_data.extend_from_slice(&(tokenized.len() as u32).to_le_bytes());
+                                            for token in &tokenized {
+                                                encoded_data.push(token.instrument_id);
+                                                encoded_data.extend_from_slice(&token.run_id.to_le_bytes());
+                                                encoded_data.push(token.flowcell_id);
+                                                encoded_data.push(token.lane);
+                                                encoded_data.extend_from_slice(&token.tile.to_le_bytes());
+                                                encoded_data.extend_from_slice(&token.x_coord.to_le_bytes());
+                                                encoded_data.extend_from_slice(&token.y_coord.to_le_bytes());
+                                                
+                                                if let Some(umi_id) = token.umi_id {
+                                                    encoded_data.extend_from_slice(&umi_id.to_le_bytes());
+                                                } else {
+                                                    encoded_data.extend_from_slice(&0xFFFFu16.to_le_bytes());
+                                                }
+                                                
+                                                encoded_data.push(token.read_num);
+                                                encoded_data.push(token.flags);
+                                                
+                                                if let Some(index_id) = token.index_id {
+                                                    encoded_data.push(index_id);
+                                                } else {
+                                                    encoded_data.push(0xFF);
+                                                }
+                                            }
+                                            
+                                            // Apply basic compression
+                                            compress(&encoded_data, buf, block_info.codec)
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("Tokenization failed: {}, falling back to original compression", e);
+                                    compress(&data[..block_info.uncompr_size], buf, block_info.codec)
+                                }
+                            }
+                        } else {
+                            println!("Tokenization not beneficial for this dataset");
+                            compress(&data[..block_info.uncompr_size], buf, block_info.codec)
+                        }
+                    } else {
+                        compress(&data[..block_info.uncompr_size], buf, block_info.codec)
+                    }
+                } else {
+                    // Non-read-name fields, compress normally
+                    compress(&data[..block_info.uncompr_size], buf, block_info.codec)
+                };
+                
                 buf_queue_tx.send(data).unwrap();
-
+    
                 let field_name = format!("{:?}", block_info.field);
                 let uncompressed_size = block_info.uncompr_size;
                 let compressed_size = compr_data.len();
-
+    
                 let log_line = format!(
                     "Field: {}, Uncompressed: {}, Compressed: {}\n",
                     field_name, uncompressed_size, compressed_size
                 );
-
+    
                 compressed_tx
                     .send(CompressTask {
                         ordering_key,
