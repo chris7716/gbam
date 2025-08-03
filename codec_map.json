@@ -7,7 +7,7 @@
   "NextRefID": "Brotli",
   "NextPos": "Brotli",
   "TemplateLength": "Brotli",
-  "ReadName": "Zstd",
+  "ReadName": "Brotli",
   "RawCigar": "Brotli",
   "RawSequence": "Brotli",
   "RawQual": "Zstd",
