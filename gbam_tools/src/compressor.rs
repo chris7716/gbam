@@ -192,7 +192,6 @@ impl Compressor {
         let mut tokenizer = IlluminaTokenizer::new();
         match tokenizer.tokenize_batch(&read_name_refs) {
             Ok(tokenized) => {
-                println!("Tokenization successful! Applying post-tokenization compression...");
                 
                 // Apply post-tokenization compression
                 let post_compressor = PostTokenizationCompressor::new(

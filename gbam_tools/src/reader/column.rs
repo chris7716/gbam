@@ -172,7 +172,6 @@ fn fetch_block(inner_column: &mut Inner, block_num: usize) -> Result<()> {
     if uncompressed_size > 0 {
         // Check if this is a tokenized ReadName block
         if field == &Fields::ReadName && block_meta.is_tokenized {
-            println!("Processing tokenized ReadName block {}", block_num);
             
             match decode_tokenized_readname_block(
                 data, 
@@ -182,9 +181,7 @@ fn fetch_block(inner_column: &mut Inner, block_num: usize) -> Result<()> {
                 codec,
                 block_num
             ) {
-                Ok(_) => {
-                    println!("Successfully processed tokenized block {}", block_num);
-                }
+                Ok(_) => {}
                 Err(e) => {
                     eprintln!("Tokenized decoding failed for block {}: {}", block_num, e);
                     eprintln!("This likely indicates a metadata inconsistency - block marked as tokenized but contains standard data");
@@ -473,7 +470,6 @@ fn decode_post_tokenization_compressed_readnames(
     _codec: &Codecs,
     block_id: usize
 ) -> std::io::Result<()> {
-    println!("Starting post-tokenization compressed decoding, data size: {}", compressed_data.len());
     
     use crate::tokenizer_encoding::post_compression::{PostTokenizationCompressor, PostTokenizationConfig};
     
@@ -482,7 +478,6 @@ fn decode_post_tokenization_compressed_readnames(
     
     let tokens = match post_compressor.decompress_tokenized_data(compressed_data, dictionary) {
         Ok(tokens) => {
-            println!("Post-tokenization decompression successful, {} tokens", tokens.len());
             tokens
         }
         Err(e) => {
@@ -494,7 +489,6 @@ fn decode_post_tokenization_compressed_readnames(
     // Convert tokens back to read names and write to buffer
     match convert_tokens_to_buffer(&tokens, dictionary, dest_buffer) {
         Ok(_) => {
-            println!("Successfully converted {} post-tokenized tokens to buffer", tokens.len());
             Ok(())
         }
         Err(e) => {
@@ -514,17 +508,12 @@ pub fn decode_tokenized_readname_block(
 ) -> std::io::Result<()> {
     
     if let Some(dict_id) = block_meta.dictionary_id {
-        println!("Decoding tokenized ReadName block with dictionary ID: {}", dict_id);
         
         let dict_entry = file_meta.get_dictionary(dict_id).unwrap();
         let dictionary = deserialize_dictionary(&dict_entry.dictionary_data).unwrap();
         
-        println!("Dictionary loaded, method: {:?}", dict_entry.method);
-        
         // Based on compression logs, ALL blocks use post-tokenization compression
         // The compression never fell back to fallback_tokenization
-        println!("Using post-tokenization decompression (only method used during compression)");
-        
         decode_post_tokenization_compressed_readnames(
             compressed_data, 
             dest_buffer, 

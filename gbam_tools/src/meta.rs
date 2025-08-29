@@ -188,12 +188,6 @@ impl FileMeta {
         // let dict_id = self.read_name_dictionaries.len() as u32;
         let dict_id = Local::now().timestamp_millis() as u32;
         self.next_dictionary_id += 1;
-        println!("Adding dictionary with ID: {}", dict_id);
-
-        match String::from_utf8(dict_data.clone()) {
-            Ok(s) => println!("Human-readable dictionary data:\n{}", s),
-            Err(_) => println!("Dictionary data (not valid UTF-8): {:?}", dict_data),
-        }
         
         self.read_name_dictionaries.insert(dict_id, SerializedDictionary {
             dictionary_data: dict_data,

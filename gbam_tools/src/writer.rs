@@ -288,7 +288,6 @@ fn handle_dictionary_result(mut task: CompressTask, file_meta: &mut FileMeta) ->
                 
                 // Update block info with actual dictionary ID
                 task.block_info.dictionary_id = Some(actual_dict_id);
-                println!("Created new dictionary with ID: {}", actual_dict_id);
             }
             DictionaryAction::UseExisting(dict_id) => {
                 file_meta.increment_dictionary_usage(dict_id);
