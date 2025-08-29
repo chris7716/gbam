@@ -9,6 +9,8 @@ use serde::de::{MapAccess, Visitor};
 // use serde::de::{Deserialize, Deserializer};
 // use serde_json::Result;
 use std::collections::HashMap;
+use sha2::{Sha256, Digest};
+use chrono::Local;
 
 /// Holds data related to GBAM file: gbam version, seekpos to meta.
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -19,6 +21,8 @@ pub(crate) struct FileInfo {
     pub crc32: u32,
     pub is_sorted: bool,
     pub creation_command: String,
+    #[serde(default)]
+    pub read_name_dictionaries: HashMap<u32, SerializedDictionary>,
 }
 
 impl FileInfo {
@@ -36,8 +40,25 @@ impl FileInfo {
             crc32,
             creation_command: full_command,
             is_sorted,
+            read_name_dictionaries: HashMap::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SerializedDictionary {
+    pub dictionary_data: Vec<u8>,
+    pub block_count: usize, // How many blocks use this dictionary
+    pub method: TokenizationMethod,
+    pub created_at_block: u32, // Which block first created this dictionary
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum TokenizationMethod {
+    None,
+    IlluminaLegacy,
+    IlluminaModern,
+    PostTokenizationCompressed,
 }
 
 /// Should be enough for JSON.
@@ -103,6 +124,11 @@ pub struct BlockMeta {
     pub block_size: u32,
     pub uncompressed_size: u64,
     pub stats: Option<Stat>,
+    #[serde(default)]
+    pub dictionary_id: Option<u32>,
+    
+    #[serde(default)]
+    pub is_tokenized: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -143,6 +169,9 @@ pub struct FileMeta {
     field_to_meta: [FieldMeta; FIELDS_NUM],
     sam_header: Vec<u8>,
     name_to_ref_id: Vec<(String, u32)>,
+    #[serde(default)]
+    pub read_name_dictionaries: HashMap<u32, SerializedDictionary>,
+    pub next_dictionary_id: u32,
 }
 
 impl FileMeta {
@@ -153,6 +182,47 @@ impl FileMeta {
     #[allow(dead_code)]
     pub fn get_sam_header(&self) -> &[u8] {
         &self.sam_header[..]
+    }
+
+    pub fn add_dictionary(&mut self, dict_data: Vec<u8>, method: TokenizationMethod, block_num: u32) -> u32 {
+        // let dict_id = self.read_name_dictionaries.len() as u32;
+        let dict_id = Local::now().timestamp_millis() as u32;
+        self.next_dictionary_id += 1;
+        println!("Adding dictionary with ID: {}", dict_id);
+
+        match String::from_utf8(dict_data.clone()) {
+            Ok(s) => println!("Human-readable dictionary data:\n{}", s),
+            Err(_) => println!("Dictionary data (not valid UTF-8): {:?}", dict_data),
+        }
+        
+        self.read_name_dictionaries.insert(dict_id, SerializedDictionary {
+            dictionary_data: dict_data,
+            block_count: 1,
+            method,
+            created_at_block: block_num,
+        });
+        
+        dict_id
+    }
+
+    pub fn increment_dictionary_usage(&mut self, dict_id: u32) {
+        if let Some(dict) = self.read_name_dictionaries.get_mut(&dict_id) {
+            dict.block_count += 1;
+        }
+    }
+    
+    pub fn get_dictionary(&self, dict_id: u32) -> Option<&SerializedDictionary> {
+        self.read_name_dictionaries.get(&dict_id)
+    }
+    
+    pub fn get_dictionaries(&self) -> &HashMap<u32, SerializedDictionary> {
+        &self.read_name_dictionaries
+    }
+    
+    pub fn find_compatible_dictionary(&self) -> Option<u32> {
+        // Simple implementation - return first available dictionary
+        // Could be enhanced to check dictionary compatibility
+        self.read_name_dictionaries.keys().next().copied()
     }
 }
 
@@ -262,6 +332,8 @@ impl FileMeta {
             field_to_meta: map,
             sam_header,
             name_to_ref_id: ref_seqs,
+            read_name_dictionaries: HashMap::new(),
+            next_dictionary_id: 0,
         }
     }
 

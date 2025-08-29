@@ -1,6 +1,8 @@
 //! Dictionary management for read name components
 
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::{Write, BufWriter};
 
 /// Tokenized representation of a read name
 #[derive(Debug, Clone, PartialEq)]
@@ -44,6 +46,32 @@ impl ReadNameDictionary {
             umi_map: HashMap::new(),
             index_map: HashMap::new(),
         }
+    }
+
+    pub fn write_to_file(&self, path: &str) -> std::io::Result<()> {
+        let mut file = BufWriter::new(File::create(path)?);
+
+        writeln!(file, "Instruments:")?;
+        for (i, inst) in self.instruments.iter().enumerate() {
+            writeln!(file, "  [{}] {}", i, String::from_utf8_lossy(inst))?;
+        }
+
+        writeln!(file, "Flowcells:")?;
+        for (i, fc) in self.flowcells.iter().enumerate() {
+            writeln!(file, "  [{}] {}", i, String::from_utf8_lossy(fc))?;
+        }
+
+        writeln!(file, "UMIs:")?;
+        for (i, umi) in self.umis.iter().enumerate() {
+            writeln!(file, "  [{}] {}", i, String::from_utf8_lossy(umi))?;
+        }
+
+        writeln!(file, "Indices:")?;
+        for (i, idx) in self.indices.iter().enumerate() {
+            writeln!(file, "  [{}] {}", i, String::from_utf8_lossy(idx))?;
+        }
+
+        Ok(())
     }
 
     pub fn add_instrument(&mut self, instrument: &[u8]) -> u8 {

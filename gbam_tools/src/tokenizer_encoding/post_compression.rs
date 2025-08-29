@@ -79,19 +79,16 @@ impl PostTokenizationCompressor {
         // Stage 1: RLE if beneficial
         if self.config.use_rle && self.calculate_rle_benefit(&working_data) > self.config.rle_threshold {
             working_data = self.run_length_encode(&working_data);
-            println!("Applied RLE to {}: {} -> {} bytes", stream_name, data.len(), working_data.len());
         }
         
         // Stage 2: Huffman encoding
         if self.config.use_huffman && self.should_use_huffman(&working_data) {
             working_data = self.huffman_encode(&working_data)?;
-            println!("Applied Huffman to {}: size after Huffman: {} bytes", stream_name, working_data.len());
         }
         
         // Stage 3: Final DEFLATE compression
         if self.config.use_deflate {
             let deflated = self.deflate_compress(&working_data)?;
-            println!("Applied DEFLATE to {}: {} -> {} bytes", stream_name, working_data.len(), deflated.len());
             working_data = deflated;
         }
         
@@ -101,19 +98,14 @@ impl PostTokenizationCompressor {
     fn compress_numeric_stream(&self, data: &[u32], stream_name: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         // Stage 1: Delta encoding + varint
         let mut compressed = if self.config.use_delta_encoding && data.len() > 1 {
-            println!("Applying delta encoding to {}", stream_name);
             self.delta_encode_with_varint(data)
         } else {
-            println!("Applying direct varint encoding to {}", stream_name);
             self.direct_varint_encode(data)
         };
-        
-        println!("{} after varint: {} bytes", stream_name, compressed.len());
         
         // Stage 2: Final compression
         if self.config.use_deflate {
             let deflated = self.deflate_compress(&compressed)?;
-            println!("{} after DEFLATE: {} -> {} bytes", stream_name, compressed.len(), deflated.len());
             compressed = deflated;
         }
         
@@ -337,7 +329,6 @@ impl PostTokenizationCompressor {
     }
 
     fn compress_all_streams(&self, streams: &TokenizedStreams) -> Result<CompressedStreams, Box<dyn std::error::Error>> {
-        println!("\n=== Compressing Individual Streams ===");
         
         Ok(CompressedStreams {
             instrument_ids: self.compress_categorical_stream(&streams.instrument_ids, "instrument_ids")?,
@@ -419,6 +410,600 @@ impl PostTokenizationCompressor {
         block
     }
 
+    fn decode_varint(&self, data: &[u8], cursor: &mut usize) -> Result<i32, Box<dyn std::error::Error>> {
+        let mut result = 0u32;
+        let mut shift = 0;
+        
+        while *cursor < data.len() {
+            let byte = data[*cursor];
+            *cursor += 1;
+            
+            result |= ((byte & 0x7F) as u32) << shift;
+            
+            if (byte & 0x80) == 0 {
+                break;
+            }
+            
+            shift += 7;
+            if shift >= 35 { // Allow full 5-byte varint
+                return Err("Varint too long".into());
+            }
+        }
+        
+        // ZigZag decode: (n >> 1) ^ (-(n & 1))
+        let zigzag_decoded = ((result >> 1) as i32) ^ (-((result & 1) as i32));
+        Ok(zigzag_decoded)
+    }
+    
+    pub fn decompress_tokenized_data(
+        &self,
+        compressed_data: &[u8],
+        dictionary: &ReadNameDictionary,
+    ) -> Result<Vec<TokenizedReadName>, Box<dyn std::error::Error>> {
+        
+        println!("=== POST-TOKENIZATION DECOMPRESSION DEBUG ===");
+        println!("Compressed data size: {} bytes", compressed_data.len());
+        println!("First 16 bytes: {:02x?}", &compressed_data[..std::cmp::min(16, compressed_data.len())]);
+        
+        // Step 1: Parse the varint-encoded dictionary size
+        let mut cursor = 0;
+        let dict_size = self.decode_varint(compressed_data, &mut cursor)?;
+        println!("Dictionary size from varint: {} bytes (cursor at {})", dict_size, cursor);
+        
+        if dict_size < 0 || dict_size as usize > compressed_data.len() {
+            return Err(format!("Invalid dictionary size: {}", dict_size).into());
+        }
+        
+        // Step 2: Skip embedded dictionary (we use the provided one)
+        let embedded_dict = &compressed_data[cursor..cursor + dict_size as usize];
+        let streams_start = cursor + dict_size as usize;
+        
+        if streams_start > compressed_data.len() {
+            return Err("Invalid compressed data: dictionary size exceeds data length".into());
+        }
+        
+        println!("Embedded dictionary: {} bytes, streams start at: {}", dict_size, streams_start);
+        let streams_data = &compressed_data[streams_start..];
+        println!("Streams data size: {} bytes", streams_data.len());
+        
+        // Step 3: Decompress all streams
+        let streams = self.decompress_all_streams(streams_data)?;
+        
+        // Step 4: Reconstruct tokens from streams
+        Ok(self.reconstruct_tokens(streams))
+    }
+
+    fn decompress_all_streams(&self, streams_data: &[u8]) -> Result<TokenizedStreams, Box<dyn std::error::Error>> {
+        println!("\n=== Decompressing Individual Streams ===");
+        let mut cursor = 0;
+        
+        // Stream 1: instrument_ids
+        println!("Decompressing instrument_ids stream...");
+        let instrument_ids_size = self.decode_varint(streams_data, &mut cursor)?;
+        println!("  Size: {} bytes", instrument_ids_size);
+        if cursor + instrument_ids_size as usize > streams_data.len() {
+            return Err(format!("instrument_ids stream exceeds data bounds").into());
+        }
+        let instrument_ids_data = &streams_data[cursor..cursor + instrument_ids_size as usize];
+        cursor += instrument_ids_size as usize;
+        let instrument_ids = self.decompress_u8_stream(instrument_ids_data, "instrument_ids")?;
+        
+        // Stream 2: run_ids
+        println!("Decompressing run_ids stream...");
+        let run_ids_size = self.decode_varint(streams_data, &mut cursor)?;
+        println!("  Size: {} bytes", run_ids_size);
+        if cursor + run_ids_size as usize > streams_data.len() {
+            return Err(format!("run_ids stream exceeds data bounds").into());
+        }
+        let run_ids_data = &streams_data[cursor..cursor + run_ids_size as usize];
+        cursor += run_ids_size as usize;
+        let run_ids = self.decompress_u32_stream(run_ids_data, "run_ids")?;
+        
+        // Stream 3: flowcell_ids
+        println!("Decompressing flowcell_ids stream...");
+        let flowcell_ids_size = self.decode_varint(streams_data, &mut cursor)?;
+        println!("  Size: {} bytes", flowcell_ids_size);
+        if cursor + flowcell_ids_size as usize > streams_data.len() {
+            return Err(format!("flowcell_ids stream exceeds data bounds").into());
+        }
+        let flowcell_ids_data = &streams_data[cursor..cursor + flowcell_ids_size as usize];
+        cursor += flowcell_ids_size as usize;
+        let flowcell_ids = self.decompress_u8_stream(flowcell_ids_data, "flowcell_ids")?;
+        
+        // Stream 4: lanes
+        println!("Decompressing lanes stream...");
+        let lanes_size = self.decode_varint(streams_data, &mut cursor)?;
+        println!("  Size: {} bytes", lanes_size);
+        if cursor + lanes_size as usize > streams_data.len() {
+            return Err(format!("lanes stream exceeds data bounds").into());
+        }
+        let lanes_data = &streams_data[cursor..cursor + lanes_size as usize];
+        cursor += lanes_size as usize;
+        let lanes = self.decompress_u8_stream(lanes_data, "lanes")?;
+        
+        // Stream 5: read_nums
+        println!("Decompressing read_nums stream...");
+        let read_nums_size = self.decode_varint(streams_data, &mut cursor)?;
+        println!("  Size: {} bytes", read_nums_size);
+        if cursor + read_nums_size as usize > streams_data.len() {
+            return Err(format!("read_nums stream exceeds data bounds").into());
+        }
+        let read_nums_data = &streams_data[cursor..cursor + read_nums_size as usize];
+        cursor += read_nums_size as usize;
+        let read_nums = self.decompress_u8_stream(read_nums_data, "read_nums")?;
+        
+        // Stream 6: flags
+        println!("Decompressing flags stream...");
+        let flags_size = self.decode_varint(streams_data, &mut cursor)?;
+        println!("  Size: {} bytes", flags_size);
+        if cursor + flags_size as usize > streams_data.len() {
+            return Err(format!("flags stream exceeds data bounds").into());
+        }
+        let flags_data = &streams_data[cursor..cursor + flags_size as usize];
+        cursor += flags_size as usize;
+        let flags = self.decompress_u8_stream(flags_data, "flags")?;
+        
+        // Stream 7: coordinates (combined x_coords, y_coords, tiles)
+        println!("Decompressing coordinates stream...");
+        let coordinates_size = self.decode_varint(streams_data, &mut cursor)?;
+        println!("  Size: {} bytes", coordinates_size);
+        if cursor + coordinates_size as usize > streams_data.len() {
+            return Err(format!("coordinates stream exceeds data bounds").into());
+        }
+        let coordinates_data = &streams_data[cursor..cursor + coordinates_size as usize];
+        cursor += coordinates_size as usize;
+        let (x_coords, y_coords, tiles) = self.decompress_coordinate_streams(coordinates_data)?;
+        
+        // Stream 8: umi_ids (sparse)
+        println!("Decompressing umi_ids stream...");
+        let umi_ids_size = self.decode_varint(streams_data, &mut cursor)?;
+        println!("  Size: {} bytes", umi_ids_size);
+        if cursor + umi_ids_size as usize > streams_data.len() {
+            return Err(format!("umi_ids stream exceeds data bounds").into());
+        }
+        let umi_ids_data = &streams_data[cursor..cursor + umi_ids_size as usize];
+        cursor += umi_ids_size as usize;
+        let umi_ids = self.decompress_sparse_u16_stream(umi_ids_data, "umi_ids")?;
+        
+        // Stream 9: index_ids (sparse)
+        println!("Decompressing index_ids stream...");
+        let index_ids_size = self.decode_varint(streams_data, &mut cursor)?;
+        println!("  Size: {} bytes", index_ids_size);
+        if cursor + index_ids_size as usize > streams_data.len() {
+            return Err(format!("index_ids stream exceeds data bounds").into());
+        }
+        let index_ids_data = &streams_data[cursor..cursor + index_ids_size as usize];
+        cursor += index_ids_size as usize;
+        let index_ids = self.decompress_sparse_u8_stream(index_ids_data, "index_ids")?;
+        
+        println!("All streams decompressed successfully");
+        println!("Final cursor position: {} / {}", cursor, streams_data.len());
+        
+        Ok(TokenizedStreams {
+            instrument_ids,
+            run_ids,
+            flowcell_ids,
+            lanes,
+            tiles,
+            x_coords,
+            y_coords,
+            umi_ids,
+            read_nums,
+            flags,
+            index_ids,
+        })
+    }
+
+    fn deflate_decompress(&self, data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        use flate2::read::ZlibDecoder;
+        use std::io::Read;
+        
+        println!("      Attempting zlib decompression on {} bytes", data.len());
+        println!("      Data starts with: {:02x?}", &data[..std::cmp::min(8, data.len())]);
+        
+        let mut decoder = ZlibDecoder::new(data);
+        let mut decompressed = Vec::new();
+        match decoder.read_to_end(&mut decompressed) {
+            Ok(bytes_read) => {
+                println!("      ✓ Zlib decompression successful: {} bytes read", bytes_read);
+                Ok(decompressed)
+            }
+            Err(e) => {
+                println!("      ✗ Zlib decompression error: {}", e);
+                Err(e.into())
+            }
+        }
+    }
+
+    fn decompress_u8_stream(&self, compressed_data: &[u8], stream_name: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        println!("    Decompressing {} stream: {} bytes", stream_name, compressed_data.len());
+        println!("    First 16 bytes: {:02x?}", &compressed_data[..std::cmp::min(16, compressed_data.len())]);
+        
+        // Check if this looks like DEFLATE data
+        if compressed_data.len() >= 2 {
+            let header = u16::from_be_bytes([compressed_data[0], compressed_data[1]]);
+            println!("    Header: 0x{:04x}", header);
+            
+            // DEFLATE (zlib) headers: 0x789c (default), 0x78da (best compression), etc.
+            if (compressed_data[0] & 0x0F) == 0x08 && (header % 31) == 0 {
+                println!("    This looks like valid zlib data, trying DEFLATE...");
+                match self.deflate_decompress(compressed_data) {
+                    Ok(decompressed) => {
+                        println!("    ✓ DEFLATE decompression successful: {} bytes", decompressed.len());
+                        // Continue with further decoding (RLE, Huffman)
+                        return self.reverse_categorical_encoding(&decompressed, stream_name);
+                    }
+                    Err(e) => {
+                        println!("    ✗ DEFLATE failed despite good header: {}", e);
+                    }
+                }
+            } else {
+                println!("    This doesn't look like zlib data, skipping DEFLATE");
+            }
+        }
+        
+        // Not DEFLATE data, try direct decoding
+        println!("    Attempting direct categorical decoding...");
+        self.reverse_categorical_encoding(compressed_data, stream_name)
+    }
+
+    fn reverse_categorical_encoding(&self, data: &[u8], stream_name: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        println!("      Reversing categorical encoding for {}", stream_name);
+        
+        // The compression applies layers in this order:
+        // 1. RLE (if beneficial)
+        // 2. Huffman (if beneficial)
+        // 3. DEFLATE (if enabled)
+        //
+        // So decompression should reverse in opposite order:
+        // 1. DEFLATE (already handled)
+        // 2. Huffman
+        // 3. RLE
+        
+        // For now, since Huffman is just a passthrough, try RLE first
+        println!("      Trying RLE decoding first...");
+        match self.try_decode_rle(data) {
+            Ok(rle_decoded) => {
+                println!("      ✓ RLE decoding successful: {} -> {} bytes", data.len(), rle_decoded.len());
+                Ok(rle_decoded)
+            }
+            Err(e) => {
+                println!("      RLE failed ({}), trying as raw data", e);
+                // If RLE fails, maybe it wasn't RLE encoded - return raw data
+                Ok(data.to_vec())
+            }
+        }
+    }
+    
+    fn try_decode_huffman(&self, data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        // For now, since your Huffman encoding is simplified (just returns input),
+        // return the data as-is
+        // TODO: Implement proper Huffman decoding when you implement proper Huffman encoding
+        println!("      Huffman decode (placeholder): {} bytes", data.len());
+        Ok(data.to_vec())
+    }
+    
+    fn try_decode_rle(&self, data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let mut decoded = Vec::new();
+        let mut cursor = 0;
+        
+        println!("      Attempting RLE decode on {} bytes", data.len());
+        println!("      RLE data starts: {:02x?}", &data[..std::cmp::min(8, data.len())]);
+        
+        while cursor < data.len() {
+            // Save cursor position for error reporting
+            let start_cursor = cursor;
+            
+            // Try to decode varint count
+            let count = match self.decode_varint(data, &mut cursor) {
+                Ok(c) => c,
+                Err(e) => {
+                    println!("      RLE varint decode failed at cursor {} (bytes: {:02x?}): {}", 
+                        start_cursor, 
+                        &data[start_cursor..std::cmp::min(start_cursor + 8, data.len())],
+                        e
+                    );
+                    return Err(format!("RLE varint decode failed at {}: {}", start_cursor, e).into());
+                }
+            };
+            
+            if cursor >= data.len() {
+                return Err("RLE: Incomplete data, missing value byte".into());
+            }
+            
+            let value = data[cursor];
+            cursor += 1;
+            
+            // Sanity check
+            if count < 0 {
+                // Handle ZigZag decoding if needed
+                return Err(format!("RLE: Negative count: {}", count).into());
+            }
+            
+            if count > 1_000_000 {
+                return Err(format!("RLE: Count too large: {}", count).into());
+            }
+            
+            // Extend with the repeated value
+            let count_u = count as usize;
+            for _ in 0..count_u {
+                decoded.push(value);
+            }
+            
+            // Safety check
+            if decoded.len() > 10_000_000 {
+                return Err("RLE decode result too large".into());
+            }
+        }
+        
+        println!("      RLE decode successful: {} bytes", decoded.len());
+        Ok(decoded)
+    }
+
+    fn decompress_u16_stream(&self, data: &[u8], _stream_name: &str) -> Result<Vec<u16>, Box<dyn std::error::Error>> {
+        let bytes = self.deflate_decompress(data)?;
+        if bytes.len() % 2 != 0 {
+            return Err("Invalid u16 stream: odd number of bytes".into());
+        }
+        
+        Ok(bytes.chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect())
+    }
+
+    fn decompress_u32_stream(&self, compressed_data: &[u8], stream_name: &str) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+        println!("    Decompressing {} stream: {} bytes", stream_name, compressed_data.len());
+        
+        // First decompress with DEFLATE
+        let deflate_decompressed = self.deflate_decompress(compressed_data)?;
+        println!("    After DEFLATE: {} bytes", deflate_decompressed.len());
+        
+        // Then reverse varint/delta encoding
+        let values = self.decode_u32_varint_stream(&deflate_decompressed, stream_name == "run_ids")?;
+        println!("    Decoded {} u32 values", values.len());
+        
+        Ok(values)
+    }
+
+    fn decompress_coordinate_streams(&self, compressed_data: &[u8]) -> Result<(Vec<u32>, Vec<u32>, Vec<u16>), Box<dyn std::error::Error>> {
+        println!("    Decompressing coordinate streams: {} bytes", compressed_data.len());
+        
+        // First decompress with DEFLATE
+        let deflate_decompressed = self.deflate_decompress(compressed_data)?;
+        println!("    After DEFLATE: {} bytes", deflate_decompressed.len());
+        
+        // Then decode 2D delta encoding + varints
+        let (x_coords, y_coords, tiles) = self.decode_2d_coordinate_deltas(&deflate_decompressed)?;
+        println!("    Decoded {} coordinates", x_coords.len());
+        
+        Ok((x_coords, y_coords, tiles))
+    }
+
+    fn decompress_sparse_u16_stream(&self, compressed_data: &[u8], stream_name: &str) -> Result<Vec<Option<u16>>, Box<dyn std::error::Error>> {
+        println!("    Decompressing sparse {} stream: {} bytes", stream_name, compressed_data.len());
+        
+        // Sparse streams have bitmap + values format
+        let (bitmap, values) = self.decode_sparse_u16_data(compressed_data)?;
+        println!("    Decoded {} sparse u16 values", bitmap.len());
+        
+        Ok(self.reconstruct_sparse_u16_stream(&bitmap, &values))
+    }
+
+    fn decompress_sparse_u8_stream(&self, compressed_data: &[u8], stream_name: &str) -> Result<Vec<Option<u8>>, Box<dyn std::error::Error>> {
+        println!("    Decompressing sparse {} stream: {} bytes", stream_name, compressed_data.len());
+        
+        // Sparse streams have bitmap + values format  
+        let (bitmap, values) = self.decode_sparse_u8_data(compressed_data)?;
+        println!("    Decoded {} sparse u8 values", bitmap.len());
+        
+        Ok(self.reconstruct_sparse_u8_stream(&bitmap, &values))
+    }
+
+    fn decompress_optional_u16_stream(&self, data: &[u8], stream_name: &str) -> Result<Vec<Option<u16>>, Box<dyn std::error::Error>> {
+        let values = self.decompress_u16_stream(data, stream_name)?;
+        Ok(values.into_iter()
+            .map(|v| if v == 0xFFFF { None } else { Some(v) })
+            .collect())
+    }
+
+    fn decompress_optional_u8_stream(&self, data: &[u8], stream_name: &str) -> Result<Vec<Option<u8>>, Box<dyn std::error::Error>> {
+        let values = self.decompress_u8_stream(data, stream_name)?;
+        Ok(values.into_iter()
+            .map(|v| if v == 0xFF { None } else { Some(v) })
+            .collect())
+    }
+
+    fn decode_u32_varint_stream(&self, data: &[u8], use_delta: bool) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+        let mut values = Vec::new();
+        let mut cursor = 0;
+        
+        if use_delta {
+            // First value is absolute
+            if cursor < data.len() {
+                let first = self.decode_varint(data, &mut cursor)?;
+                values.push(first as u32);
+                
+                // Remaining values are deltas
+                while cursor < data.len() {
+                    let delta = self.decode_varint(data, &mut cursor)?;
+                    let prev = *values.last().unwrap();
+                    values.push((prev as i32 + delta) as u32);
+                }
+            }
+        } else {
+            // All values are absolute
+            while cursor < data.len() {
+                let value = self.decode_varint(data, &mut cursor)?;
+                values.push(value as u32);
+            }
+        }
+        
+        Ok(values)
+    }
+
+    fn decode_2d_coordinate_deltas(&self, data: &[u8]) -> Result<(Vec<u32>, Vec<u32>, Vec<u16>), Box<dyn std::error::Error>> {
+        let mut x_coords = Vec::new();
+        let mut y_coords = Vec::new();
+        let mut tiles = Vec::new();
+        
+        let mut cursor = 0;
+        let mut last_x = 0i32;
+        let mut last_y = 0i32;
+        let mut last_tile = 0i32;
+        
+        while cursor < data.len() {
+            // Read delta triplet: dx, dy, dtile
+            let dx = self.decode_varint(data, &mut cursor)?;
+            let dy = self.decode_varint(data, &mut cursor)?;
+            let dtile = self.decode_varint(data, &mut cursor)?;
+            
+            // Apply deltas
+            last_x += dx;
+            last_y += dy;
+            last_tile += dtile;
+            
+            x_coords.push(last_x as u32);
+            y_coords.push(last_y as u32);
+            tiles.push(last_tile as u16);
+        }
+        
+        Ok((x_coords, y_coords, tiles))
+    }
+
+    fn decode_sparse_u16_data(&self, data: &[u8]) -> Result<(Vec<u8>, Vec<u16>), Box<dyn std::error::Error>> {
+        let mut cursor = 0;
+        
+        // Read bitmap size and decompress bitmap
+        let bitmap_size = self.decode_varint(data, &mut cursor)? as usize;
+        let bitmap_data = &data[cursor..cursor + bitmap_size];
+        cursor += bitmap_size;
+        let bitmap = self.deflate_decompress(bitmap_data)?;
+        
+        // Read values size and decompress values
+        let values_size = self.decode_varint(data, &mut cursor)? as usize;
+        let values_data = &data[cursor..cursor + values_size];
+        let values_bytes = self.deflate_decompress(values_data)?;
+        
+        // Decode varint values
+        let mut values = Vec::new();
+        let mut val_cursor = 0;
+        while val_cursor < values_bytes.len() {
+            let val = self.decode_varint(&values_bytes, &mut val_cursor)?;
+            values.push(val as u16);
+        }
+        
+        Ok((bitmap, values))
+    }
+
+    fn decode_sparse_u8_data(&self, data: &[u8]) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error>> {
+        let mut cursor = 0;
+        
+        // Read bitmap size and decompress bitmap
+        let bitmap_size = self.decode_varint(data, &mut cursor)? as usize;
+        let bitmap_data = &data[cursor..cursor + bitmap_size];
+        cursor += bitmap_size;
+        let bitmap = self.deflate_decompress(bitmap_data)?;
+        
+        // Read values size and decompress values
+        let values_size = self.decode_varint(data, &mut cursor)? as usize;
+        let values_data = &data[cursor..cursor + values_size];
+        let values_bytes = self.deflate_decompress(values_data)?;
+        
+        // Decode varint values as u8
+        let mut values = Vec::new();
+        let mut val_cursor = 0;
+        while val_cursor < values_bytes.len() {
+            let val = self.decode_varint(&values_bytes, &mut val_cursor)?;
+            values.push(val as u8);
+        }
+        
+        Ok((bitmap, values))
+    }
+
+    fn reconstruct_sparse_u16_stream(&self, bitmap: &[u8], values: &[u16]) -> Vec<Option<u16>> {
+        let mut result = Vec::new();
+        let mut value_idx = 0;
+        
+        for &byte in bitmap {
+            for bit in 0..8 {
+                if (byte >> bit) & 1 == 1 {
+                    // Bit is set, use next value
+                    if value_idx < values.len() {
+                        result.push(Some(values[value_idx]));
+                        value_idx += 1;
+                    } else {
+                        result.push(None);
+                    }
+                } else {
+                    // Bit is not set, use None
+                    result.push(None);
+                }
+            }
+        }
+        
+        result
+    }
+
+    fn reconstruct_sparse_u8_stream(&self, bitmap: &[u8], values: &[u8]) -> Vec<Option<u8>> {
+        let mut result = Vec::new();
+        let mut value_idx = 0;
+        
+        for &byte in bitmap {
+            for bit in 0..8 {
+                if (byte >> bit) & 1 == 1 {
+                    // Bit is set, use next value
+                    if value_idx < values.len() {
+                        result.push(Some(values[value_idx]));
+                        value_idx += 1;
+                    } else {
+                        result.push(None);
+                    }
+                } else {
+                    // Bit is not set, use None
+                    result.push(None);
+                }
+            }
+        }
+        
+        result
+    }
+
+    
+
+    fn decompress_bytes(&self, compressed: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        // Simple deflate decompression for now
+        // You can enhance this to detect compression type and use appropriate decompression
+        use flate2::read::DeflateDecoder;
+        use std::io::Read;
+        
+        let mut decoder = DeflateDecoder::new(compressed);
+        let mut decompressed = Vec::new();
+        decoder.read_to_end(&mut decompressed)?;
+        Ok(decompressed)
+    }
+    
+    fn reconstruct_tokens(&self, streams: TokenizedStreams) -> Vec<TokenizedReadName> {
+        let count = streams.instrument_ids.len();
+        let mut tokens = Vec::with_capacity(count);
+        
+        for i in 0..count {
+            tokens.push(TokenizedReadName {
+                instrument_id: streams.instrument_ids[i],
+                run_id: streams.run_ids[i],
+                flowcell_id: streams.flowcell_ids[i],
+                lane: streams.lanes[i],
+                tile: streams.tiles[i],
+                x_coord: streams.x_coords[i],
+                y_coord: streams.y_coords[i],
+                umi_id: streams.umi_ids[i],
+                read_num: streams.read_nums[i],
+                flags: streams.flags[i],
+                index_id: streams.index_ids[i],
+            });
+        }
+        
+        tokens
+    }
     // Add remaining helper methods...
 }
 

@@ -1,5 +1,5 @@
 use super::meta::{BlockMeta, Codecs, FileInfo, FileMeta, Stat, FILE_INFO_SIZE};
-use crate::compressor::{CompressTask, Compressor, OrderingKey};
+use crate::compressor::{CompressTask, Compressor, OrderingKey, DictionaryAction};
 use crate::{SIZE_LIMIT, U32_SIZE};
 use bam_tools::record::bamrawrecord::BAMRawRecord;
 use bam_tools::record::fields::{
@@ -16,10 +16,12 @@ use once_cell::sync::Lazy;
 use std::fs;
 use std::path::Path;
 use serde_json::Value;
+use serde::{Deserialize, Deserializer, Serialize};
 use std::str::FromStr;
 
 use crate::tokenizer_encoding::{IlluminaTokenizer, ReadNameAnalyzer, ReadNamePattern};
 
+#[derive(Deserialize, Serialize, Clone)]
 pub(crate) struct BlockInfo {
     pub numitems: u32,
     pub uncompr_size: usize,
@@ -27,6 +29,11 @@ pub(crate) struct BlockInfo {
     // Interpretation is up to the reader.
     pub stats: Option<Stat>,
     pub codec: Codecs,
+    #[serde(default)]
+    pub dictionary_id: Option<u32>, // Reference to dictionary in FileMeta
+    
+    #[serde(default)]
+    pub is_tokenized: bool,
 }
 
 impl Default for BlockInfo {
@@ -37,6 +44,8 @@ impl Default for BlockInfo {
             field: Fields::RefID,
             stats: None,
             codec: Codecs::Brotli,
+            dictionary_id: None,
+            is_tokenized: false,
         }
     }
 }
@@ -238,18 +247,60 @@ fn flush_field_buffer<WS: Write + Seek>(
         inner.generate_block_info(),
         data,
         codec,
+        &file_meta
     );
 
     let mut completed_task = compressor.get_compr_block();
+    // let mut updated_task = compressor.handle_compression_result(completed_task, file_meta);
 
-    if let OrderingKey::Key(key) = completed_task.ordering_key {
-        write_data_and_update_meta(writer, file_meta, key, &mut completed_task);
-    }
+    // if let OrderingKey::Key(key) = completed_task.ordering_key {
+    //     write_data_and_update_meta(writer, file_meta, key, &mut completed_task);
+    // }
+
+    // Use updated_task.buf instead of completed_task.buf
+    // inner.buffer = completed_task.buf;
 
     // We need to reuse the same buffer for the next task, as it is always the same size so we can avoid re-allocating the same buffer for each processed block
-    inner.buffer = completed_task.buf;
+    // inner.buffer = completed_task.buf;
+
+    // Handle dictionary updates after compression
+    let mut updated_task = handle_dictionary_result(completed_task, file_meta);
+
+    if let OrderingKey::Key(key) = updated_task.ordering_key {
+        write_data_and_update_meta(writer, file_meta, key, &mut updated_task);
+    }
+
+    inner.buffer = updated_task.buf;
+    inner.reset_for_new_block();
 
     inner.reset_for_new_block();
+}
+
+fn handle_dictionary_result(mut task: CompressTask, file_meta: &mut FileMeta) -> CompressTask {
+    if let Some(dict_info) = task.dictionary_info.take() {
+        match dict_info.action {
+            DictionaryAction::CreateNew(dict_data) => {
+                let actual_dict_id = file_meta.add_dictionary(
+                    dict_data, 
+                    dict_info.tokenization_method, 
+                    task.block_info.numitems
+                );
+                
+                // Update block info with actual dictionary ID
+                task.block_info.dictionary_id = Some(actual_dict_id);
+                println!("Created new dictionary with ID: {}", actual_dict_id);
+            }
+            DictionaryAction::UseExisting(dict_id) => {
+                file_meta.increment_dictionary_usage(dict_id);
+                println!("Used existing dictionary {}", dict_id);
+            }
+            DictionaryAction::None => {
+                // No action needed
+            }
+        }
+    }
+    
+    task
 }
 
 fn write_data_and_update_meta<WS: Write + Seek>(
@@ -288,6 +339,8 @@ fn generate_meta<S: Seek>(
         block_size,
         uncompressed_size: block_info.uncompr_size as u64,
         stats: block_info.stats.take(),
+        dictionary_id: block_info.dictionary_id,
+        is_tokenized: block_info.is_tokenized,
     }
 }
 
@@ -358,6 +411,8 @@ impl Inner {
             field: self.field,
             stats: stat,
             codec: codec,
+            dictionary_id: None,
+            is_tokenized: false,
         }
     }
 }
