@@ -19,7 +19,7 @@ use std::fs::File;
 // use lz4_flex::block::{compress_into, get_maximum_output_size};
 use lzzzz::lz4;
 use xz2::write::XzEncoder;
-
+static LOG_FILE: OnceLock<Mutex<File>> = OnceLock::new();
 
 pub(crate) enum OrderingKey {
     Key(u64),
@@ -98,6 +98,13 @@ impl Compressor {
                     "Field: {}, Uncompressed: {}, Compressed: {}\n",
                     field_name, uncompressed_size, compressed_size
                 );
+
+                let file = LOG_FILE.get_or_init(|| {
+                    Mutex::new(File::create("compression_log.txt").expect("Failed to open log file"))
+                });
+
+                let mut log_file = file.lock().unwrap();
+                log_file.write_all(log_line.as_bytes()).unwrap();
 
                 compressed_tx
                     .send(CompressTask {
