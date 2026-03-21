@@ -26,13 +26,18 @@ add_executable(gbam
     codec.cpp
 )
 
+# Link brotli statically to avoid shared library symbol resolution issues
+find_library(BROTLI_DEC_LIB    NAMES libbrotlidec-static.a    libbrotlidec.a    brotlidec    PATHS "$ENV{HOME}/.local/lib" NO_DEFAULT_PATH)
+find_library(BROTLI_ENC_LIB    NAMES libbrotlienc-static.a    libbrotlienc.a    brotlienc    PATHS "$ENV{HOME}/.local/lib" NO_DEFAULT_PATH)
+find_library(BROTLI_COMMON_LIB NAMES libbrotlicommon-static.a libbrotlicommon.a brotlicommon PATHS "$ENV{HOME}/.local/lib" NO_DEFAULT_PATH)
+
 target_link_libraries(gbam
     hts
     z
     lz4
-    brotlidec
-    brotlienc
-    brotlicommon
+    ${BROTLI_DEC_LIB}
+    ${BROTLI_ENC_LIB}
+    ${BROTLI_COMMON_LIB}
     zstd
     OpenMP::OpenMP_CXX
 )
