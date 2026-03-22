@@ -94,13 +94,19 @@ static int read_gbam(const char* file_path) {
         Reader reader(mapped);
         BamAlnGuard aln;
 
-        htsFile* out = hts_open("-", "w");
-        sam_hdr_write(out, reader.header());
+        // Write SAM header directly — avoids htslib format-detection picking BAM
+        std::fwrite(sam_hdr_str(reader.header()), 1,
+                    sam_hdr_length(reader.header()), stdout);
+
+        kstring_t str = {0, 0, nullptr};
         for (int64_t i = 0; i < reader.rec_num(); ++i) {
             reader.read_record(i, aln.p);
-            sam_write1(out, reader.header(), aln.p);
+            sam_format1(reader.header(), aln.p, &str);
+            std::fwrite(str.s, 1, str.l, stdout);
+            std::fputc('\n', stdout);
+            str.l = 0;
         }
-        hts_close(out);
+        free(str.s);
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << '\n';
         munmap(mapped, file_size);
