@@ -123,7 +123,7 @@ void Writer::write_record(const bam1_t* aln) {
 
     append_var(ColumnType::read_name,
                reinterpret_cast<const uint8_t*>(bam_get_qname(aln)),
-               aln->core.l_qname);
+               aln->core.l_qname - aln->core.l_extranul);
     append_var(ColumnType::cigar,
                reinterpret_cast<const uint8_t*>(bam_get_cigar(aln)),
                static_cast<int64_t>(aln->core.n_cigar) << 2);
