@@ -68,7 +68,7 @@ void Reader::fetch_field(int64_t rec_num, int col) {
     int l = -1, r = static_cast<int>(counts.size()) - 1;
     while ((r - l) > 1) {
         int m = (l + r) / 2;
-        if (rec_num <= counts[m]) l = m;
+        if (counts[m] <= rec_num) l = m;
         else                       r = m;
     }
     // r is the chunk index
