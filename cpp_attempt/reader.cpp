@@ -120,7 +120,12 @@ void Reader::read_record(int64_t rec_num, bam1_t* aln) {
     {
         end = read_le<int32_t>(&columns_[ci(idx_col)].data[adjusted(ci(idx_col)) * 4]);
         beg = 0;
-        if (rec_num != 0) {
+        // Only read the previous index entry if rec_num is not the first record
+        // in its data chunk.  When the data column was flushed mid-stream the
+        // index column was NOT flushed together, so its entries reset to 0 at
+        // each data-chunk boundary.  Reading across that boundary gives a
+        // nonsensical (negative) length.
+        if (rec_num != 0 && rec_num != loaded_since_rec_num_[ci(data_col)]) {
             fetch_field(rec_num - 1, ci(idx_col));
             int64_t prev_adj = (rec_num - 1) - loaded_since_rec_num_[ci(idx_col)];
             beg = read_le<int32_t>(&columns_[ci(idx_col)].data[prev_adj * 4]);
