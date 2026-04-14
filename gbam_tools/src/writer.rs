@@ -535,8 +535,8 @@ struct GraphPathWriterColumn {
     index: FixedColumn,
     /// Shared, immutable variation graph.
     graph: Arc<VariationGraph>,
-    /// read_name (no null terminator) → ordered node IDs from the GAF file.
-    path_map: HashMap<String, Vec<u32>>,
+    /// read_name (no null terminator) → PathInfo (node IDs + path_start).
+    path_map: HashMap<String, PathInfo>,
 }
 
 impl GraphPathWriterColumn {
