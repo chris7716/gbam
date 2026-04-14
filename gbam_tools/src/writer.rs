@@ -570,7 +570,28 @@ impl GraphPathWriterColumn {
         let read_seq = read_seq_str.as_bytes();
 
         let name = Self::read_name(rec);
-        match self.path_map.get(name) {
+
+        // Determine the paired-end suffix used by `samtools fastq` (/1 or /2)
+        // from the BAM FLAG field, so we look up the correct per-mate path.
+        // FLAG bit 0x01: read is paired; 0x40: first in pair; 0x80: second.
+        let flag_bytes = rec.get_bytes(&Fields::Flags);
+        let flag = u16::from_le_bytes([flag_bytes[0], flag_bytes[1]]);
+        let suffix = if flag & 0x01 != 0 {
+            if flag & 0x40 != 0 { "/1" } else { "/2" }
+        } else {
+            ""
+        };
+
+        // Try name+suffix first; fall back to bare name (handles unpaired reads
+        // or GAF files that don't carry the /1 /2 convention).
+        let node_ids = if suffix.is_empty() {
+            self.path_map.get(name)
+        } else {
+            let suffixed = format!("{}{}", name, suffix);
+            self.path_map.get(suffixed.as_str()).or_else(|| self.path_map.get(name))
+        };
+
+        match node_ids {
             Some(node_ids) => {
                 // Reconstruct path sequence from graph nodes.
                 let path_seq: Vec<u8> = node_ids

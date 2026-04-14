@@ -33,17 +33,10 @@ pub fn parse_gaf<R: Read>(reader: R) -> std::io::Result<HashMap<String, Vec<u32>
             continue;
         }
         let mut cols = line.splitn(7, '\t');
-        let raw_name = match cols.next() {
-            Some(n) => n,
+        let read_name = match cols.next() {
+            Some(n) => n.to_string(),
             None => continue,
         };
-        // Strip paired-end suffixes (/1, /2) added by samtools fastq so that
-        // names match the read names stored in the BAM.
-        let read_name = raw_name
-            .strip_suffix("/1")
-            .or_else(|| raw_name.strip_suffix("/2"))
-            .unwrap_or(raw_name)
-            .to_string();
         // Skip columns 1-4
         for _ in 0..4 {
             if cols.next().is_none() {
