@@ -206,10 +206,11 @@ pub fn decompress_block(source: &[u8], dest: &mut Vec<u8>, codec: &Codecs) -> st
             dest.clear();
             dest.extend_from_slice(source);
         }
-        // GraphPath data is stored without additional byte-level compression.
+        // GraphPath blocks are compressed with Brotli (same as the writer).
         Codecs::GraphPath => {
             dest.clear();
-            dest.extend_from_slice(source);
+            let mut decompressor = brotli::Decompressor::new(source, 4096);
+            decompressor.read_to_end(dest)?;
         }
     };
     Ok(())

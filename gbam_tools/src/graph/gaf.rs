@@ -27,14 +27,23 @@ pub fn parse_gaf<R: Read>(reader: R) -> std::io::Result<HashMap<String, Vec<u32>
 
     for line in buf.lines() {
         let line = line?;
-        if line.is_empty() || line.starts_with('#') {
+        // Skip empty lines, comments, and SAM header lines that vg giraffe
+        // may emit at the start of GAF output.
+        if line.is_empty() || line.starts_with('#') || line.starts_with('@') {
             continue;
         }
         let mut cols = line.splitn(7, '\t');
-        let read_name = match cols.next() {
-            Some(n) => n.to_string(),
+        let raw_name = match cols.next() {
+            Some(n) => n,
             None => continue,
         };
+        // Strip paired-end suffixes (/1, /2) added by samtools fastq so that
+        // names match the read names stored in the BAM.
+        let read_name = raw_name
+            .strip_suffix("/1")
+            .or_else(|| raw_name.strip_suffix("/2"))
+            .unwrap_or(raw_name)
+            .to_string();
         // Skip columns 1-4
         for _ in 0..4 {
             if cols.next().is_none() {
