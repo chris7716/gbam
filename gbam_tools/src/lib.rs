@@ -9,6 +9,13 @@ pub mod bam {
     /// GBAM to BAM converter
     pub mod gbam_to_bam;
 }
+
+/// Variation-graph path encoding: GFA parser, GAF parser, path codec.
+pub mod graph {
+    pub mod gaf;
+    pub mod gfa;
+    pub mod path_codec;
+}
 ///
 pub mod utils {
     /// BED reader
@@ -49,7 +56,7 @@ pub mod writer;
 // use self::writer::Writer;
 // pub use {ParsingTemplate, Reader};
 use self::writer::Writer;
-pub use bam::bam_to_gbam::{bam_sort_to_gbam, bam_to_gbam};
+pub use bam::bam_to_gbam::{bam_sort_to_gbam, bam_to_gbam, bam_to_gbam_with_graph};
 pub use bam_tools::record::fields::Fields;
 pub use meta::Codecs;
 

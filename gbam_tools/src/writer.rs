@@ -1,20 +1,22 @@
 use super::meta::{BlockMeta, Codecs, FileInfo, FileMeta, Stat, FILE_INFO_SIZE};
 use crate::compressor::{CompressTask, Compressor, OrderingKey};
+use crate::graph::gfa::VariationGraph;
+use crate::graph::path_codec::{compute_edits, encode_without_path, GraphPathEntry};
 use crate::{SIZE_LIMIT, U32_SIZE};
-use bam_tools::record::bamrawrecord::BAMRawRecord;
+use bam_tools::record::bamrawrecord::{decode_seq, BAMRawRecord};
 use bam_tools::record::fields::{
     field_type, is_data_field, var_size_field_to_index, FieldType, Fields, FIELDS_NUM,
 };
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use crc32fast::Hasher;
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::convert::TryInto;
 use std::io::{Seek, SeekFrom, Write};
-use std::collections::HashMap;
+use std::sync::Arc;
 use once_cell::sync::Lazy;
 use std::fs;
-use std::path::Path;
 use serde_json::Value;
 use std::str::FromStr;
 
@@ -55,6 +57,7 @@ pub static FIELD_CODEC_MAP: Lazy<HashMap<Fields, Codecs>> = Lazy::new(|| {
             "Lz4" => Codecs::Lz4,
             "Gzip" => Codecs::Gzip,
             "NoCompression" => Codecs::NoCompression,
+            "GraphPath" => Codecs::GraphPath,
             other => panic!("Unsupported codec: {}", other),
         };
         map.insert(field, codec);
@@ -155,6 +158,60 @@ where
             is_sorted,
             false
         )
+    }
+
+    /// Construct a writer where the `RawSequence` column uses variation-graph
+    /// path encoding instead of raw 4-bit packed bases.
+    ///
+    /// `path_map` maps each read name (no null terminator) to its ordered list
+    /// of graph node IDs, as produced by parsing a GAF alignment file.
+    ///
+    /// All other columns use `codec` unchanged.
+    pub fn new_with_graph(
+        mut inner: WS,
+        codec: Codecs,
+        thread_num: usize,
+        ref_seqs: Vec<(String, u32)>,
+        sam_header: Vec<u8>,
+        full_command: String,
+        is_sorted: bool,
+        pangenome_graph_uri: String,
+        graph: Arc<VariationGraph>,
+        path_map: HashMap<String, Vec<u32>>,
+    ) -> Self {
+        inner
+            .seek(SeekFrom::Start(FILE_INFO_SIZE as u64))
+            .unwrap();
+
+        let mut columns: Vec<Box<dyn Column>> = Vec::new();
+        let mut count = 0;
+
+        for field in Fields::iterator().filter(|f| is_data_field(f)) {
+            let col: Box<dyn Column> = if *field == Fields::RawSequence {
+                // Replace normal variable column with graph-path encoder.
+                count += 1; // index column counted internally
+                Box::new(GraphPathWriterColumn::new(graph.clone(), path_map.clone()))
+            } else {
+                match field_type(field) {
+                    FieldType::FixedSized => Box::new(FixedColumn::new(*field, None)),
+                    FieldType::VariableSized => {
+                        count += 1;
+                        Box::new(VariableColumn::new(*field, None))
+                    }
+                }
+            };
+            columns.push(col);
+            count += 1;
+        }
+        debug_assert!(count == FIELDS_NUM);
+
+        Self {
+            file_meta: FileMeta::new_with_graph(codec, ref_seqs, sam_header, pangenome_graph_uri),
+            inner,
+            compressor: Compressor::new(thread_num),
+            columns,
+            file_info: FileInfo::new([1, 0], 0, 0, full_command, is_sorted),
+        }
     }
 
     /// Push BAM record into this writer
@@ -441,6 +498,111 @@ impl Column for VariableColumn {
         assert!(inner.stats_collector.is_none());
 
         inner.write_data(data);
+        (&mut idx_buf[..])
+            .write_u32::<LittleEndian>(u32::try_from(inner.offset).unwrap())
+            .unwrap();
+        index_inner.write_data(&idx_buf)
+    }
+
+    fn get_inners(&mut self) -> (&mut Inner, Option<&mut Inner>) {
+        (&mut self.inner, Some(&mut self.index.0))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Graph-path writer column
+// ---------------------------------------------------------------------------
+
+/// Replaces the standard `VariableColumn` for `RawSequence` when graph-path
+/// encoding is requested.
+///
+/// On each `write_record_field` call it:
+/// 1. Extracts the read name from the BAM record.
+/// 2. Looks up the pre-computed path (node IDs) in `path_map`.
+/// 3. Reconstructs the path sequence from the graph and computes edits against
+///    the actual 4-bit decoded read sequence.
+/// 4. Serialises the `GraphPathEntry` and writes it to the internal buffer,
+///    using the same variable-length indexing scheme as `VariableColumn`.
+///
+/// Reads absent from `path_map` (e.g. unmapped reads) fall back to
+/// `encode_without_path`, which stores every base as an edit. This is
+/// lossless but storage-inefficient for truly unmapped reads.
+struct GraphPathWriterColumn {
+    /// Buffer and bookkeeping for the path+edits byte stream.
+    inner: Inner,
+    /// Cumulative offset index (mirrors VariableColumn index).
+    index: FixedColumn,
+    /// Shared, immutable variation graph.
+    graph: Arc<VariationGraph>,
+    /// read_name (no null terminator) → ordered node IDs from the GAF file.
+    path_map: HashMap<String, Vec<u32>>,
+}
+
+impl GraphPathWriterColumn {
+    pub fn new(
+        graph: Arc<VariationGraph>,
+        path_map: HashMap<String, Vec<u32>>,
+    ) -> Self {
+        Self {
+            inner: Inner::new(Fields::RawSequence, None),
+            index: FixedColumn::new(Fields::RawSeqLen, None),
+            graph,
+            path_map,
+        }
+    }
+
+    /// Extract the read name from a BAM record as a clean UTF-8 string.
+    ///
+    /// BAM stores the read name null-terminated; we strip the `\0` before
+    /// using it as a map key.
+    fn read_name<'a>(rec: &'a BAMRawRecord<'a>) -> &'a str {
+        let bytes = rec.get_bytes(&Fields::ReadName);
+        let trimmed = bytes.strip_suffix(b"\0").unwrap_or(bytes);
+        std::str::from_utf8(trimmed).unwrap_or("")
+    }
+
+    /// Build a `GraphPathEntry` for one BAM record.
+    fn make_entry(&self, rec: &BAMRawRecord) -> GraphPathEntry {
+        // Decode the BAM 4-bit packed sequence to ASCII.
+        let raw_seq_bytes = rec.get_bytes(&Fields::RawSequence);
+        let mut read_seq_str = String::new();
+        decode_seq(raw_seq_bytes, &mut read_seq_str);
+        let read_seq = read_seq_str.as_bytes();
+
+        let name = Self::read_name(rec);
+        match self.path_map.get(name) {
+            Some(node_ids) => {
+                // Reconstruct path sequence from graph nodes.
+                let path_seq: Vec<u8> = node_ids
+                    .iter()
+                    .flat_map(|&id| {
+                        self.graph.node_seq(id).unwrap_or(&[]).iter().copied()
+                    })
+                    .collect();
+                let edits = compute_edits(&path_seq, read_seq);
+                GraphPathEntry::new(read_seq.len() as u32, node_ids.clone(), edits)
+            }
+            None => encode_without_path(read_seq),
+        }
+    }
+}
+
+impl Column for GraphPathWriterColumn {
+    fn write_record_field(&mut self, rec: &BAMRawRecord) -> WriteStatus {
+        let encoded = self.make_entry(rec).to_bytes();
+
+        let index_inner = &mut self.index.0;
+        let inner = &mut self.inner;
+        let mut idx_buf: [u8; U32_SIZE] = [0; U32_SIZE];
+
+        if index_inner.flush_required(&idx_buf) {
+            return WriteStatus::Full(index_inner);
+        }
+        if inner.flush_required(&encoded) {
+            return WriteStatus::Full(inner);
+        }
+
+        inner.write_data(&encoded);
         (&mut idx_buf[..])
             .write_u32::<LittleEndian>(u32::try_from(inner.offset).unwrap())
             .unwrap();

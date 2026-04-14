@@ -179,6 +179,13 @@ pub fn compress(source: &[u8], mut dest: Vec<u8>, codec: Codecs) -> Vec<u8> {
             dest.extend_from_slice(source);
             Ok(dest)
         }
+        // GraphPath data is already in a compact integer encoding; no
+        // additional byte-level compression is applied at the block level.
+        Codecs::GraphPath => {
+            dest.clear();
+            dest.extend_from_slice(source);
+            Ok(dest)
+        }
     };
     compressed_bytes.unwrap()
 }

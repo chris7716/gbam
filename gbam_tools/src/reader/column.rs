@@ -2,6 +2,8 @@ use std::{collections::BTreeMap, io::Result, sync::Arc};
 
 use super::reader::generate_block_treemap;
 use super::record::GbamRecord;
+use crate::graph::gfa::VariationGraph;
+use crate::graph::path_codec::GraphPathEntry;
 use crate::SIZE_LIMIT;
 use bam_tools::record::fields::Fields;
 use byteorder::{LittleEndian, ReadBytesExt};
@@ -204,6 +206,86 @@ pub fn decompress_block(source: &[u8], dest: &mut Vec<u8>, codec: &Codecs) -> st
             dest.clear();
             dest.extend_from_slice(source);
         }
+        // GraphPath data is stored without additional byte-level compression.
+        Codecs::GraphPath => {
+            dest.clear();
+            dest.extend_from_slice(source);
+        }
     };
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Graph-path reader column
+// ---------------------------------------------------------------------------
+
+/// Column that reads graph-path encoded `RawSequence` data and reconstructs
+/// the ASCII read sequence on demand using the shared `VariationGraph`.
+///
+/// The internal buffer and offset-index work identically to `VariableColumn`;
+/// the only difference is how `fill_record_field` interprets the raw bytes.
+pub struct GraphPathReaderColumn {
+    inner: Inner,
+    index: FixedColumn,
+    blocks: BTreeMap<usize, usize>,
+    graph: Arc<VariationGraph>,
+}
+
+impl GraphPathReaderColumn {
+    pub fn new(inner: Inner, index: FixedColumn, graph: Arc<VariationGraph>) -> Self {
+        Self {
+            blocks: generate_block_treemap(&inner.meta, &inner.field),
+            inner,
+            index,
+            graph,
+        }
+    }
+
+    fn get_item(&mut self, item_num: usize) -> &[u8] {
+        if let Some((range_begin, block_num)) = self.find_block(item_num) {
+            Self::update_buffer(&mut self.inner, block_num, range_begin);
+        }
+        let rec_num_in_block = item_num - self.inner.range_begin;
+        let mut read_offset =
+            |n| self.index.get_item(n).read_u32::<LittleEndian>().unwrap() as usize;
+        let start = match rec_num_in_block {
+            0 => 0,
+            _ => read_offset(item_num - 1),
+        };
+        let end = read_offset(item_num);
+        &self.inner.buffer[start..end]
+    }
+
+    fn find_block(&self, item_num: usize) -> Option<(usize, usize)> {
+        if item_num >= self.inner.range_begin && item_num < self.inner.range_end {
+            return None;
+        }
+        Some(
+            self.blocks
+                .range(..=item_num)
+                .next_back()
+                .map_or((0, 0), |(&range_begin, &block_num)| {
+                    (range_begin, block_num)
+                }),
+        )
+    }
+
+    fn update_buffer(inner: &mut Inner, block_num: usize, range_begin: usize) {
+        fetch_block(inner, block_num).unwrap();
+        let block_len = inner.meta.view_blocks(&inner.field)[block_num].numitems as usize;
+        inner.range_begin = range_begin;
+        inner.range_end = inner.range_begin + block_len;
+    }
+}
+
+impl Column for GraphPathReaderColumn {
+    /// Decode the graph-path entry for `item_num` and write the reconstructed
+    /// ASCII sequence directly into `rec.seq`.
+    fn fill_record_field(&mut self, item_num: usize, rec: &mut GbamRecord) {
+        let bytes = self.get_item(item_num);
+        let entry =
+            GraphPathEntry::from_bytes(bytes).expect("Corrupt GraphPath data in RawSequence column");
+        let ascii_seq = entry.reconstruct_sequence(&self.graph);
+        rec.seq = Some(String::from_utf8(ascii_seq).unwrap_or_default());
+    }
 }

@@ -8,11 +8,12 @@ use bam_tools::record::fields::{
 use memmap2::Mmap;
 use memmap2::MmapOptions;
 
-use crate::meta::{BlockMeta, FileInfo, FileMeta, FILE_INFO_SIZE};
+use crate::graph::gfa::VariationGraph;
+use crate::meta::{BlockMeta, Codecs, FileInfo, FileMeta, FILE_INFO_SIZE};
 use crate::writer::calc_crc_for_meta_bytes;
 
 use super::{
-    column::{Column, FixedColumn, Inner, VariableColumn},
+    column::{Column, FixedColumn, GraphPathReaderColumn, Inner, VariableColumn},
     parse_tmplt::ParsingTemplate,
     record::GbamRecord,
     records::Records,
@@ -31,11 +32,12 @@ pub struct Reader {
     _inner: Box<File>,
     index_mapping: Option<Arc<Vec<u32>>>,
     pub mmap: Arc<Mmap>,
+    /// Pangenome graph required when any column uses `Codecs::GraphPath`.
+    pub graph: Option<Arc<VariationGraph>>,
 }
 
 impl Reader {
     pub fn new(inner: File, parsing_template: ParsingTemplate) -> std::io::Result<Self> {
-        let inner = inner;
         let mmap = unsafe { Mmap::map(inner.borrow())? };
         let file_meta = verify_and_parse_meta(&mmap)?;
         Self::new_with_meta(inner, parsing_template, &Arc::new(file_meta), None)
@@ -46,7 +48,6 @@ impl Reader {
         parsing_template: ParsingTemplate,
         index_mapping: Option<Arc<Vec<u32>>>,
     ) -> std::io::Result<Self> {
-        let inner = inner;
         let mmap = unsafe { Mmap::map(inner.borrow())? };
         let file_meta = verify_and_parse_meta(&mmap)?;
         Self::new_with_meta(inner, parsing_template, &Arc::new(file_meta), index_mapping)
@@ -58,13 +59,39 @@ impl Reader {
         file_meta: &Arc<FileMeta>,
         index_mapping: Option<Arc<Vec<u32>>>,
     ) -> std::io::Result<Self> {
+        Self::new_with_meta_and_graph(_inner, parsing_template, file_meta, index_mapping, None)
+    }
+
+    /// Open a graph-encoded GBAM file, supplying the pangenome graph needed to
+    /// reconstruct sequences stored with `Codecs::GraphPath`.
+    pub fn new_with_graph(
+        inner: File,
+        parsing_template: ParsingTemplate,
+        graph: Arc<VariationGraph>,
+    ) -> std::io::Result<Self> {
+        let mmap = unsafe { Mmap::map(inner.borrow())? };
+        let file_meta = verify_and_parse_meta(&mmap)?;
+        Self::new_with_meta_and_graph(
+            inner,
+            parsing_template,
+            &Arc::new(file_meta),
+            None,
+            Some(graph),
+        )
+    }
+
+    /// Internal constructor used by all public entry points.
+    pub fn new_with_meta_and_graph(
+        _inner: File,
+        parsing_template: ParsingTemplate,
+        file_meta: &Arc<FileMeta>,
+        index_mapping: Option<Arc<Vec<u32>>>,
+        graph: Option<Arc<VariationGraph>>,
+    ) -> std::io::Result<Self> {
         let _copy = _inner.try_clone()?;
         let _inner: Box<File> = Box::new(_inner);
 
         let mmap = Arc::new(unsafe { MmapOptions::new().map(&_copy)? });
-        // mmap.advise(memmap2::Advice::WillNeed)?;
-        // Consumes up to 16 percent of runtime on big files (20GB).
-        // verify(&mmap)?;
         let amount = usize::try_from(
             file_meta
                 .view_blocks(&Fields::RefID)
@@ -75,7 +102,7 @@ impl Reader {
         let meta = file_meta.clone();
 
         Ok(Self {
-            columns: init_columns(&mmap, &parsing_template, &meta),
+            columns: init_columns(&mmap, &parsing_template, &meta, graph.clone()),
             original_template: parsing_template.clone(),
             parsing_template,
             file_meta: meta,
@@ -83,6 +110,7 @@ impl Reader {
             _inner,
             mmap,
             index_mapping: index_mapping.clone(),
+            graph,
         })
     }
 
@@ -127,16 +155,36 @@ fn init_columns(
     mmap: &Arc<Mmap>,
     parse_template: &ParsingTemplate,
     meta: &Arc<FileMeta>,
+    graph: Option<Arc<VariationGraph>>,
 ) -> Vec<Option<Box<dyn Column + Send>>> {
     let mut res = Vec::new();
     (0..FIELDS_NUM).for_each(|_| res.push(None));
     for &field in parse_template.get_active_fields_iter() {
-        res[field as usize] = Some(init_col(field, mmap, meta));
+        res[field as usize] = Some(init_col(field, mmap, meta, graph.clone()));
     }
     res
 }
 
-fn init_col(field: Fields, mmap: &Arc<Mmap>, meta: &Arc<FileMeta>) -> Box<dyn Column + Send> {
+fn init_col(
+    field: Fields,
+    mmap: &Arc<Mmap>,
+    meta: &Arc<FileMeta>,
+    graph: Option<Arc<VariationGraph>>,
+) -> Box<dyn Column + Send> {
+    // If this field uses GraphPath encoding, use the specialised reader column.
+    if field == Fields::RawSequence && *meta.get_field_codec(&field) == Codecs::GraphPath {
+        let inner = Inner::new(meta.clone(), field, mmap.clone());
+        let idx_field = var_size_field_to_index(&field); // RawSeqLen
+        let idx_inner = Inner::new(meta.clone(), idx_field, mmap.clone());
+        let idx_col =
+            FixedColumn::new(idx_inner, meta.get_field_size(&idx_field).unwrap() as usize);
+        let graph = graph.expect(
+            "A VariationGraph must be supplied when reading a GraphPath-encoded GBAM file. \
+             Use Reader::new_with_graph.",
+        );
+        return Box::new(GraphPathReaderColumn::new(inner, idx_col, graph));
+    }
+
     let inner = Inner::new(meta.clone(), field, mmap.clone());
     match field_type(&field) {
         FieldType::FixedSized => Box::new(FixedColumn::new(

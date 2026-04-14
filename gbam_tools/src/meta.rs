@@ -59,6 +59,13 @@ pub enum Codecs {
     Xz,
     /// No compression
     NoCompression,
+    /// Variation graph path encoding (valid only for the RawSequence column).
+    ///
+    /// Data is stored as (seq_len, path_node_ids[], edits[]) rather than
+    /// 4-bit packed bases. No additional byte-level compression is applied;
+    /// the integer-heavy encoding compresses well with a second-pass codec if
+    /// needed. The pangenome graph must be available at decode time.
+    GraphPath,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -142,6 +149,11 @@ pub struct FileMeta {
     field_to_meta: [FieldMeta; FIELDS_NUM],
     sam_header: Vec<u8>,
     name_to_ref_id: Vec<(String, u32)>,
+    /// URI (or local path) to the pangenome graph used for GraphPath encoding.
+    /// `None` for files that use standard per-column codecs only.
+    /// `#[serde(default)]` ensures old GBAM files (without this field) still parse.
+    #[serde(default)]
+    pub pangenome_graph_uri: Option<String>,
 }
 
 impl FileMeta {
@@ -257,14 +269,27 @@ impl FileMeta {
             map[*field as usize] = FieldMeta::new(field, codec);
         }
 
-        // When patching markdup, have to decompress and compress column. If compressing, offsets will change and ruin the file.
-        // map[Fields::Flags as usize].codec = Codecs::NoCompression;
-
         FileMeta {
             field_to_meta: map,
             sam_header,
             name_to_ref_id: ref_seqs,
+            pangenome_graph_uri: None,
         }
+    }
+
+    /// Like `new`, but additionally records the pangenome graph URI and sets
+    /// the RawSequence column codec to `Codecs::GraphPath`.
+    pub fn new_with_graph(
+        codec: Codecs,
+        ref_seqs: Vec<(String, u32)>,
+        sam_header: Vec<u8>,
+        pangenome_graph_uri: String,
+    ) -> Self {
+        let mut meta = Self::new(codec, ref_seqs, sam_header, false);
+        meta.pangenome_graph_uri = Some(pangenome_graph_uri);
+        // Override the RawSequence column to use graph-path encoding
+        meta.field_to_meta[Fields::RawSequence as usize].codec = Codecs::GraphPath;
+        meta
     }
 
     /// Used to retrieve BlockMeta vector mutable borrow, to push new blocks
