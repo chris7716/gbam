@@ -3,11 +3,11 @@ use bam_tools::{record::fields::Fields, MEGA_BYTE_SIZE};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use gbam_tools::{
     bam::bam_to_gbam::bam_sort_to_gbam,
-    bam::gbam_to_bam::gbam_to_bam,
+    bam::gbam_to_bam::{gbam_to_bam, gbam_to_bam_with_graph},
     query::depth::main_depth,
     query::flagstat::collect_stats,
     reader::{parse_tmplt::ParsingTemplate, reader::Reader, record::GbamRecord},
-    {bam_to_gbam, Codecs},
+    {bam_to_gbam, bam_to_gbam_with_graph, Codecs},
 };
 use itertools::zip_eq;
 use std::fs::OpenOptions;
@@ -102,6 +102,18 @@ struct Cli {
     /// Use codec map from JSON file if specified.
     #[structopt(long)]
     codec_map_required: bool,
+    /// Convert BAM to graph-path encoded GBAM (requires --gfa, --gaf, --graph-uri).
+    #[structopt(long)]
+    convert_to_gbam_graph: bool,
+    /// Path to the GFA v1 variation graph file (used with --convert-to-gbam-graph and --convert-to-bam).
+    #[structopt(long, parse(from_os_str))]
+    gfa: Option<PathBuf>,
+    /// Path to the GAF graph-alignment file (used with --convert-to-gbam-graph).
+    #[structopt(long, parse(from_os_str))]
+    gaf: Option<PathBuf>,
+    /// URI stored in the GBAM header identifying the graph used for encoding.
+    #[structopt(long)]
+    graph_uri: Option<String>,
 }
 
 /// Limited wrapper of `gbam_tools` converts BAM file to GBAM
@@ -110,7 +122,9 @@ fn main() {
     let args = Cli::from_args();
     let arguments_strings: Vec<String> = env::args().collect();
     let full_command = arguments_strings.join(" ");
-    if args.convert_to_gbam {
+    if args.convert_to_gbam_graph {
+        convert_to_gbam_graph(args, full_command);
+    } else if args.convert_to_gbam {
         convert(args, full_command);
     } else if args.test {
         test(args);
@@ -173,6 +187,37 @@ fn convert(args: Cli, full_command: String) {
     }
 }
 
+fn convert_to_gbam_graph(args: Cli, full_command: String) {
+    let in_path = args.in_path.as_path().to_str().expect("Couldn't parse input path.");
+    let out_path = args
+        .out_path
+        .as_ref()
+        .expect("--out-path (-o) is required for --convert-to-gbam-graph.")
+        .as_path()
+        .to_str()
+        .unwrap();
+    let gfa = args
+        .gfa
+        .as_ref()
+        .expect("--gfa is required for --convert-to-gbam-graph.")
+        .as_path()
+        .to_str()
+        .unwrap();
+    let gaf = args
+        .gaf
+        .as_ref()
+        .expect("--gaf is required for --convert-to-gbam-graph.")
+        .as_path()
+        .to_str()
+        .unwrap();
+    let graph_uri = args
+        .graph_uri
+        .as_deref()
+        .unwrap_or(gfa);
+
+    bam_to_gbam_with_graph(in_path, out_path, Codecs::Brotli, gfa, gaf, graph_uri, full_command);
+}
+
 fn convert_to_bam(args: Cli) {
     let in_path = args
         .in_path
@@ -186,7 +231,16 @@ fn convert_to_bam(args: Cli) {
         .as_path()
         .to_str()
         .unwrap();
-    gbam_to_bam(in_path, out_path);
+
+    match args.gfa.as_ref() {
+        Some(gfa_path) => {
+            let gfa = gfa_path.as_path().to_str().unwrap();
+            gbam_to_bam_with_graph(in_path, out_path, gfa);
+        }
+        None => {
+            gbam_to_bam(in_path, out_path);
+        }
+    }
 }
 
 fn flagstat(args: Cli) {
