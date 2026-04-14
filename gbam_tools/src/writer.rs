@@ -1,5 +1,6 @@
 use super::meta::{BlockMeta, Codecs, FileInfo, FileMeta, Stat, FILE_INFO_SIZE};
 use crate::compressor::{CompressTask, Compressor, OrderingKey};
+use crate::graph::gaf::PathInfo;
 use crate::graph::gfa::VariationGraph;
 use crate::graph::path_codec::{compute_edits, encode_without_path, GraphPathEntry};
 use crate::{SIZE_LIMIT, U32_SIZE};
@@ -163,8 +164,8 @@ where
     /// Construct a writer where the `RawSequence` column uses variation-graph
     /// path encoding instead of raw 4-bit packed bases.
     ///
-    /// `path_map` maps each read name (no null terminator) to its ordered list
-    /// of graph node IDs, as produced by parsing a GAF alignment file.
+    /// `path_map` maps each read name (no null terminator) to its `PathInfo`
+    /// (node IDs + path_start offset), as produced by parsing a GAF file.
     ///
     /// All other columns use `codec` unchanged.
     pub fn new_with_graph(
@@ -177,7 +178,7 @@ where
         is_sorted: bool,
         pangenome_graph_uri: String,
         graph: Arc<VariationGraph>,
-        path_map: HashMap<String, Vec<u32>>,
+        path_map: HashMap<String, PathInfo>,
     ) -> Self {
         inner
             .seek(SeekFrom::Start(FILE_INFO_SIZE as u64))
@@ -541,7 +542,7 @@ struct GraphPathWriterColumn {
 impl GraphPathWriterColumn {
     pub fn new(
         graph: Arc<VariationGraph>,
-        path_map: HashMap<String, Vec<u32>>,
+        path_map: HashMap<String, PathInfo>,
     ) -> Self {
         Self {
             inner: Inner::new(Fields::RawSequence, None),
@@ -584,30 +585,37 @@ impl GraphPathWriterColumn {
 
         // Try name+suffix first; fall back to bare name (handles unpaired reads
         // or GAF files that don't carry the /1 /2 convention).
-        let node_ids = if suffix.is_empty() {
+        let path_info = if suffix.is_empty() {
             self.path_map.get(name)
         } else {
             let suffixed = format!("{}{}", name, suffix);
             self.path_map.get(suffixed.as_str()).or_else(|| self.path_map.get(name))
         };
 
-        match node_ids {
-            Some(node_ids) => {
-                // Reconstruct path sequence from graph nodes, respecting orientation.
-                // Node IDs with REVERSE_BIT set are traversed in reverse complement.
-                let path_seq: Vec<u8> = node_ids
+        match path_info {
+            Some(info) => {
+                use crate::graph::gaf::REVERSE_BIT;
+                use crate::graph::path_codec::rev_comp;
+                // Build full path sequence with correct orientation per node.
+                let full_path_seq: Vec<u8> = info.node_ids
                     .iter()
                     .flat_map(|&encoded_id| {
-                        use crate::graph::gaf::REVERSE_BIT;
-                        use crate::graph::path_codec::rev_comp;
                         let is_reverse = encoded_id & REVERSE_BIT != 0;
                         let node_id = encoded_id & !REVERSE_BIT;
                         let seq = self.graph.node_seq(node_id).unwrap_or(&[]);
                         if is_reverse { rev_comp(seq) } else { seq.to_vec() }
                     })
                     .collect();
-                let edits = compute_edits(&path_seq, read_seq);
-                GraphPathEntry::new(read_seq.len() as u32, node_ids.clone(), edits)
+                // Skip path_start bytes before comparing with the read.
+                let path_start = info.path_start as usize;
+                let aligned = full_path_seq.get(path_start..).unwrap_or(&[]);
+                let edits = compute_edits(aligned, read_seq);
+                GraphPathEntry::new(
+                    read_seq.len() as u32,
+                    info.path_start,
+                    info.node_ids.clone(),
+                    edits,
+                )
             }
             None => encode_without_path(read_seq),
         }

@@ -69,7 +69,7 @@ pub fn bam_to_gbam_with_graph(
     // 2. Parse the GAF alignment file (read name → node ID path)
     let gaf_file = File::open(gaf_path)
         .unwrap_or_else(|e| panic!("Cannot open GAF file '{}': {}", gaf_path, e));
-    let path_map: HashMap<String, Vec<u32>> = parse_gaf(gaf_file)
+    let path_map = parse_gaf(gaf_file)
         .unwrap_or_else(|e| panic!("Failed to parse GAF '{}': {}", gaf_path, e));
 
     // 3. Open the BAM file and build the GBAM writer
