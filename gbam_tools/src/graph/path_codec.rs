@@ -19,9 +19,19 @@
 //! Wire format when n_nodes == 0:
 //!   [seq_len: u32][n_nodes=0: u32][n_raw: u32][base: u8 × n_raw]
 
+use super::gaf::REVERSE_BIT;
 use super::gfa::VariationGraph;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::Cursor;
+
+/// Return the reverse complement of an ASCII uppercase DNA sequence.
+pub fn rev_comp(seq: &[u8]) -> Vec<u8> {
+    seq.iter().rev().map(|&b| match b {
+        b'A' => b'T', b'T' => b'A',
+        b'C' => b'G', b'G' => b'C',
+        b'N' => b'N', _ => b'N',
+    }).collect()
+}
 
 /// A single base difference between the read and the graph path sequence.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,13 +136,20 @@ impl GraphPathEntry {
         let len = self.seq_len as usize;
         let mut seq = Vec::with_capacity(len);
 
-        for &node_id in &self.node_ids {
+        for &encoded_id in &self.node_ids {
             if seq.len() >= len {
                 break;
             }
+            let is_reverse = encoded_id & REVERSE_BIT != 0;
+            let node_id = encoded_id & !REVERSE_BIT;
             if let Some(node_seq) = graph.node_seq(node_id) {
                 let remaining = len - seq.len();
-                seq.extend_from_slice(&node_seq[..remaining.min(node_seq.len())]);
+                if is_reverse {
+                    let rc = rev_comp(node_seq);
+                    seq.extend_from_slice(&rc[..remaining.min(rc.len())]);
+                } else {
+                    seq.extend_from_slice(&node_seq[..remaining.min(node_seq.len())]);
+                }
             }
         }
 

@@ -16,9 +16,13 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read};
 
-/// Parse a GAF stream and return `read_name → [node_id, ...]`.
+/// Parse a GAF stream and return `read_name → [encoded_node_id, ...]`.
 ///
-/// Lines beginning with `#` and empty lines are skipped.
+/// Each node ID is encoded as a `u32` with the high bit (`0x80000000`) set
+/// when the node is traversed in reverse orientation (`<`).  Forward
+/// orientation (`>`) leaves the high bit clear.
+///
+/// Lines beginning with `#`, `@`, and empty lines are skipped.
 /// Lines with fewer than 6 tab-separated columns are silently skipped.
 /// Node names that are not parseable as `u32` are silently skipped.
 pub fn parse_gaf<R: Read>(reader: R) -> std::io::Result<HashMap<String, Vec<u32>>> {
@@ -57,21 +61,26 @@ pub fn parse_gaf<R: Read>(reader: R) -> std::io::Result<HashMap<String, Vec<u32>
     Ok(map)
 }
 
-/// Parse a GAF path string like `>1>3>4>7` or `<5>6` into ordered node IDs.
+/// The high bit of an encoded node ID marks reverse orientation.
+pub const REVERSE_BIT: u32 = 0x8000_0000;
+
+/// Parse a GAF path string like `>1>3>4>7` or `<5>6` into encoded node IDs.
 ///
-/// Segments are delimited by `>` (forward) or `<` (reverse) characters.
-/// Strand is ignored; only numeric IDs are extracted.
+/// Forward (`>`) nodes are stored as-is; reverse (`<`) nodes have the
+/// `REVERSE_BIT` set so callers can apply reverse complement when needed.
 fn parse_path_str(path: &str) -> Vec<u32> {
     let mut ids = Vec::new();
     let mut cur = String::new();
+    let mut is_reverse = false;
 
     for ch in path.chars() {
         match ch {
             '>' | '<' => {
                 if let Ok(id) = cur.trim().parse::<u32>() {
-                    ids.push(id);
+                    ids.push(if is_reverse { id | REVERSE_BIT } else { id });
                 }
                 cur.clear();
+                is_reverse = ch == '<';
             }
             c if c.is_ascii_digit() => cur.push(c),
             _ => {}
@@ -79,7 +88,7 @@ fn parse_path_str(path: &str) -> Vec<u32> {
     }
     // Flush the last segment
     if let Ok(id) = cur.trim().parse::<u32>() {
-        ids.push(id);
+        ids.push(if is_reverse { id | REVERSE_BIT } else { id });
     }
 
     ids

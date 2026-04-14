@@ -593,11 +593,17 @@ impl GraphPathWriterColumn {
 
         match node_ids {
             Some(node_ids) => {
-                // Reconstruct path sequence from graph nodes.
+                // Reconstruct path sequence from graph nodes, respecting orientation.
+                // Node IDs with REVERSE_BIT set are traversed in reverse complement.
                 let path_seq: Vec<u8> = node_ids
                     .iter()
-                    .flat_map(|&id| {
-                        self.graph.node_seq(id).unwrap_or(&[]).iter().copied()
+                    .flat_map(|&encoded_id| {
+                        use crate::graph::gaf::REVERSE_BIT;
+                        use crate::graph::path_codec::rev_comp;
+                        let is_reverse = encoded_id & REVERSE_BIT != 0;
+                        let node_id = encoded_id & !REVERSE_BIT;
+                        let seq = self.graph.node_seq(node_id).unwrap_or(&[]);
+                        if is_reverse { rev_comp(seq) } else { seq.to_vec() }
                     })
                     .collect();
                 let edits = compute_edits(&path_seq, read_seq);
