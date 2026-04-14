@@ -15,8 +15,9 @@
 //! `seq_len`, then overlay each edit at its offset.
 //!
 //! Reads with no path entry (unmapped or absent from the GAF) use `n_nodes = 0`
-//! and store every base as an edit, preserving lossless round-trip at the cost
-//! of slightly larger storage than 4-bit packed encoding.
+//! and store raw ASCII bases (1 byte/base) for compact fallback storage.
+//! Wire format when n_nodes == 0:
+//!   [seq_len: u32][n_nodes=0: u32][n_raw: u32][base: u8 × n_raw]
 
 use super::gfa::VariationGraph;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -52,22 +53,31 @@ impl GraphPathEntry {
     }
 
     /// Serialize to bytes using the binary layout described in the module doc.
+    ///
+    /// When `n_nodes == 0` (raw-fallback mode) the edits list contains all
+    /// bases at consecutive offsets.  We serialize them as plain bytes
+    /// (1 byte/base) rather than as full Edit records (5 bytes/base) to keep
+    /// fallback reads compact.
     pub fn to_bytes(&self) -> Vec<u8> {
-        // Pre-size: 4 (seq_len) + 4 (n_nodes) + 4*n + 4 (n_edits) + 5*m
-        let capacity = 8 + 4 * self.node_ids.len() + 4 + 5 * self.edits.len();
-        let mut buf = Vec::with_capacity(capacity);
-
+        let mut buf = Vec::new();
         buf.write_u32::<LittleEndian>(self.seq_len).unwrap();
-        buf.write_u32::<LittleEndian>(self.node_ids.len() as u32)
-            .unwrap();
-        for &id in &self.node_ids {
-            buf.write_u32::<LittleEndian>(id).unwrap();
-        }
-        buf.write_u32::<LittleEndian>(self.edits.len() as u32)
-            .unwrap();
-        for edit in &self.edits {
-            buf.write_u32::<LittleEndian>(edit.read_offset).unwrap();
-            buf.write_u8(edit.read_base).unwrap();
+        buf.write_u32::<LittleEndian>(self.node_ids.len() as u32).unwrap();
+
+        if self.node_ids.is_empty() {
+            // Raw-sequence fallback: store bases as 1 byte each.
+            buf.write_u32::<LittleEndian>(self.edits.len() as u32).unwrap();
+            for edit in &self.edits {
+                buf.write_u8(edit.read_base).unwrap();
+            }
+        } else {
+            for &id in &self.node_ids {
+                buf.write_u32::<LittleEndian>(id).unwrap();
+            }
+            buf.write_u32::<LittleEndian>(self.edits.len() as u32).unwrap();
+            for edit in &self.edits {
+                buf.write_u32::<LittleEndian>(edit.read_offset).unwrap();
+                buf.write_u8(edit.read_base).unwrap();
+            }
         }
 
         buf
@@ -79,6 +89,18 @@ impl GraphPathEntry {
 
         let seq_len = cur.read_u32::<LittleEndian>()?;
         let n_nodes = cur.read_u32::<LittleEndian>()? as usize;
+
+        if n_nodes == 0 {
+            // Raw-sequence fallback: bases stored as 1 byte each.
+            let n_raw = cur.read_u32::<LittleEndian>()? as usize;
+            let mut edits = Vec::with_capacity(n_raw);
+            for i in 0..n_raw {
+                let base = cur.read_u8()?;
+                edits.push(Edit { read_offset: i as u32, read_base: base });
+            }
+            return Ok(GraphPathEntry { seq_len, node_ids: vec![], edits });
+        }
+
         let mut node_ids = Vec::with_capacity(n_nodes);
         for _ in 0..n_nodes {
             node_ids.push(cur.read_u32::<LittleEndian>()?);
@@ -88,17 +110,10 @@ impl GraphPathEntry {
         for _ in 0..n_edits {
             let read_offset = cur.read_u32::<LittleEndian>()?;
             let read_base = cur.read_u8()?;
-            edits.push(Edit {
-                read_offset,
-                read_base,
-            });
+            edits.push(Edit { read_offset, read_base });
         }
 
-        Ok(GraphPathEntry {
-            seq_len,
-            node_ids,
-            edits,
-        })
+        Ok(GraphPathEntry { seq_len, node_ids, edits })
     }
 
     /// Reconstruct the ASCII read sequence using the graph node sequences plus edits.
