@@ -30,6 +30,7 @@ echo "==> [5/9] Exporting graph to GFA..."
 "$VG" convert -f chr22.vg > chr22.gfa
 
 echo "==> [6/9] Extracting chr22 reads from little.bam and converting to FASTQ..."
+samtools index "$LITTLE_BAM"
 samtools view -b "$LITTLE_BAM" chr22 > chr22_reads.bam
 READ_COUNT=$(samtools view -c chr22_reads.bam)
 echo "    chr22 reads: $READ_COUNT"
