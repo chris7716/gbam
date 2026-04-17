@@ -229,14 +229,17 @@ impl GraphPathSequenceColumn {
 
 impl Column for GraphPathSequenceColumn {
     fn fill_record_field(&mut self, item_num: usize, rec: &mut GbamRecord) {
-        // SequenceLength is the cumulative byte offset index for RawQual.
-        // Diff of consecutive entries gives l_seq (1 qual byte per base).
+        // SequenceLength is the per-block cumulative byte offset index for RawQual.
+        // The offset resets to 0 at each block boundary. Compute l_seq as:
+        //   - cur directly if item_num is the first entry in its block
+        //   - cur - prev otherwise
         let seq_len = {
             let cur = {
                 let bytes = self.seq_len_col.get_item(item_num);
                 u32::from_le_bytes(bytes.try_into().unwrap()) as usize
             };
-            if item_num == 0 {
+            let block_start = self.seq_len_col.0.range_begin;
+            if item_num == block_start {
                 cur
             } else {
                 let prev = {
