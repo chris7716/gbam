@@ -55,15 +55,7 @@ if [ ! -f chr22_reads.fastq ]; then
 else
     echo "    chr22_reads.fastq already exists, skipping"
 fi
-# Also create a BAM for round-trip comparison
-if [ ! -f chr22_reads.bam ]; then
-    bwa index chr22.fa
-    bwa mem -t 8 chr22.fa chr22_sim_1.fastq chr22_sim_2.fastq | samtools sort -o chr22_reads.bam
-    samtools index chr22_reads.bam
-else
-    echo "    chr22_reads.bam already exists, skipping"
-fi
-echo "    Reads generated: $(grep -c '^@' chr22_sim_1.fastq)"
+echo "    Reads generated: $(wc -l < chr22_sim_1.fastq) lines ($(( $(wc -l < chr22_sim_1.fastq) / 4 )) reads)"
 
 echo "==> [7/9] Indexing graph and aligning reads with vg..."
 export TMPDIR="$WORKDIR/tmp"
@@ -81,7 +73,10 @@ else
 fi
 "$VG" map -f chr22_reads.fastq -x chr22.xg -g chr22.gcsa -t 8 > chr22_aln.gam
 "$VG" convert chr22.xg -G chr22_aln.gam > chr22_aln.gaf
-echo "    Aligned reads with graph paths: $(grep -c '>' chr22_aln.gaf || true)"
+echo "    Total aligned reads: $(wc -l < chr22_aln.gaf)"
+# Surject GAM back to linear BAM (no bwa needed)
+"$VG" surject -x chr22.xg -b -t 8 chr22_aln.gam | samtools sort -o chr22_reads.bam
+samtools index chr22_reads.bam
 
 echo "==> [8/9] Encoding BAM to graph-encoded GBAM..."
 "$GBAM_BINARY" \
