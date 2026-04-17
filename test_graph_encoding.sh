@@ -10,9 +10,13 @@ mkdir -p "$WORKDIR"
 cd "$WORKDIR"
 
 echo "==> [1/9] Downloading hg19 reference..."
-wget -c "https://hgdownload.soe.ucsc.edu/goldenPath/hg19/bigZips/hg19.fa.gz"
-gunzip -f hg19.fa.gz
-samtools faidx hg19.fa
+if [ ! -f hg19.fa ]; then
+    wget -c "https://hgdownload.soe.ucsc.edu/goldenPath/hg19/bigZips/hg19.fa.gz"
+    gunzip -f hg19.fa.gz
+    samtools faidx hg19.fa
+else
+    echo "    hg19.fa already exists, skipping download"
+fi
 
 echo "==> [2/9] Extracting chr22..."
 samtools faidx hg19.fa chr22 > chr22.fa
@@ -43,7 +47,8 @@ samtools fastq chr22_reads.bam > chr22_reads.fastq
 echo "==> [7/9] Indexing graph and aligning reads with vg..."
 export TMPDIR="$WORKDIR/tmp"
 mkdir -p "$TMPDIR"
-"$VG" index -x chr22.xg -g chr22.gcsa -k 16 -b "$TMPDIR" chr22.vg
+"$VG" index -x chr22.xg chr22.vg
+"$VG" prune chr22.vg | "$VG" index -g chr22.gcsa -k 16 -b "$TMPDIR" -
 "$VG" map -f chr22_reads.fastq -x chr22.xg -g chr22.gcsa -t 8 > chr22_aln.gam
 "$VG" convert -F chr22_aln.gam > chr22_aln.gaf
 
