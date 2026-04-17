@@ -48,19 +48,22 @@ else
     echo "    chr22.gfa already exists, skipping"
 fi
 
-echo "==> [6/9] Downloading NA12878 chr22 reads..."
-NA12878_BAM="NA12878.chrom22.ILLUMINA.bwa.CEU.low_coverage.20121211.bam"
-if [ ! -f "$NA12878_BAM" ]; then
-    wget -c "ftp://ftp.1000genomes.ebi.ac.uk/vol1/ftp/data/NA12878/alignment/${NA12878_BAM}"
-    wget -c "ftp://ftp.1000genomes.ebi.ac.uk/vol1/ftp/data/NA12878/alignment/${NA12878_BAM}.bai"
+echo "==> [6/9] Simulating chr22 reads with wgsim..."
+if [ ! -f chr22_reads.fastq ]; then
+    wgsim -N 500000 -1 150 -2 150 -e 0.005 -r 0.001 chr22.fa chr22_sim_1.fastq chr22_sim_2.fastq
+    cat chr22_sim_1.fastq chr22_sim_2.fastq > chr22_reads.fastq
 else
-    echo "    NA12878 chr22 BAM already exists, skipping"
+    echo "    chr22_reads.fastq already exists, skipping"
 fi
-READ_COUNT=$(samtools view -c "$NA12878_BAM")
-echo "    chr22 reads: $READ_COUNT"
-cp "$NA12878_BAM" chr22_reads.bam
-samtools index chr22_reads.bam
-samtools fastq chr22_reads.bam > chr22_reads.fastq
+# Also create a BAM for round-trip comparison
+if [ ! -f chr22_reads.bam ]; then
+    bwa index chr22.fa
+    bwa mem -t 8 chr22.fa chr22_sim_1.fastq chr22_sim_2.fastq | samtools sort -o chr22_reads.bam
+    samtools index chr22_reads.bam
+else
+    echo "    chr22_reads.bam already exists, skipping"
+fi
+echo "    Reads generated: $(grep -c '^@' chr22_sim_1.fastq)"
 
 echo "==> [7/9] Indexing graph and aligning reads with vg..."
 export TMPDIR="$WORKDIR/tmp"
