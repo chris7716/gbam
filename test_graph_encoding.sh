@@ -47,8 +47,11 @@ samtools fastq chr22_reads.bam > chr22_reads.fastq
 echo "==> [7/9] Indexing graph and aligning reads with vg..."
 export TMPDIR="$WORKDIR/tmp"
 mkdir -p "$TMPDIR"
+echo "    vg version: $("$VG" version 2>&1 | head -1)"
+echo "    chr22.vg size: $(wc -c < chr22.vg) bytes"
 "$VG" index -x chr22.xg chr22.vg
-"$VG" prune chr22.vg | "$VG" index -g chr22.gcsa -k 16 -b "$TMPDIR" -
+"$VG" prune -k 16 chr22.vg > chr22.pruned.vg
+"$VG" index -g chr22.gcsa -k 16 -b "$TMPDIR" chr22.pruned.vg
 "$VG" map -f chr22_reads.fastq -x chr22.xg -g chr22.gcsa -t 8 > chr22_aln.gam
 "$VG" convert -F chr22_aln.gam > chr22_aln.gaf
 
