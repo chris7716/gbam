@@ -10,7 +10,7 @@ use std::str::FromStr;
 // To avoid visual clutter (no need to write Fields::* each time).
 use self::Fields::*;
 
-pub const FIELDS_NUM: usize = 18;
+pub const FIELDS_NUM: usize = 25;
 /// Fields which contain data (not index fields).
 #[allow(dead_code)]
 pub const DATA_FIELDS_NUM: usize = 13;
@@ -40,6 +40,14 @@ pub enum Fields {
     SequenceLength,
     RawTagsLen, // Not in BAM spec, needed for index GBAM file
     RawSeqLen,  // Not in BAM spec, needed for index GBAM file
+    // Pangenome graph path encoding columns
+    PathNodeIds,  // = 18, variable: flat stream of node IDs per read
+    PathStart,    // = 19, fixed u32: byte offset into path where alignment begins
+    EditOffsets,  // = 20, variable: flat stream of edit positions per read
+    EditBases,    // = 21, variable: flat stream of edit bases per read
+    NodeCounts,   // = 22, fixed u32: cumulative byte offset index for PathNodeIds
+    EditCounts,   // = 23, fixed u32: cumulative byte offset index for EditOffsets
+    EditBasesLen, // = 24, fixed u32: cumulative byte offset index for EditBases
 }
 
 impl Fields {
@@ -66,6 +74,14 @@ impl Fields {
             SequenceLength,
             RawSeqLen,
             RawTagsLen,
+            // Pangenome graph path encoding columns
+            PathNodeIds,
+            PathStart,
+            EditOffsets,
+            EditBases,
+            NodeCounts,
+            EditCounts,
+            EditBasesLen,
         ];
         FIELDS.iter()
     }
@@ -94,6 +110,13 @@ impl FromStr for Fields {
             "SequenceLength" => Ok(Fields::SequenceLength),
             "RawTagsLen" => Ok(Fields::RawTagsLen),
             "RawSeqLen" => Ok(Fields::RawSeqLen),
+            "PathNodeIds" => Ok(Fields::PathNodeIds),
+            "PathStart" => Ok(Fields::PathStart),
+            "EditOffsets" => Ok(Fields::EditOffsets),
+            "EditBases" => Ok(Fields::EditBases),
+            "NodeCounts" => Ok(Fields::NodeCounts),
+            "EditCounts" => Ok(Fields::EditCounts),
+            "EditBasesLen" => Ok(Fields::EditBasesLen),
             _ => Err(()),
         }
     }
@@ -136,11 +159,18 @@ pub fn field_item_size(field: &Fields) -> Option<usize> {
         TemplateLength => Some(U32_SIZE),
         RawTagsLen => Some(U32_SIZE),
         RawSeqLen => Some(U32_SIZE),
+        PathStart => Some(U32_SIZE),
+        NodeCounts => Some(U32_SIZE),
+        EditCounts => Some(U32_SIZE),
+        EditBasesLen => Some(U32_SIZE),
         ReadName => None,
         RawCigar => None,
         RawSequence => None,
         RawQual => None,
         RawTags => None,
+        PathNodeIds => None,
+        EditOffsets => None,
+        EditBases => None,
     }
 }
 
@@ -174,13 +204,20 @@ pub fn field_type(field: &Fields) -> FieldType {
         | Fields::NextPos
         | Fields::TemplateLength
         | Fields::RawSeqLen
-        | Fields::RawTagsLen => FieldType::FixedSized,
+        | Fields::RawTagsLen
+        | Fields::PathStart
+        | Fields::NodeCounts
+        | Fields::EditCounts
+        | Fields::EditBasesLen => FieldType::FixedSized,
         // Variable size fields
         Fields::ReadName
         | Fields::RawCigar
         | Fields::RawSequence
         | Fields::RawQual
-        | Fields::RawTags => FieldType::VariableSized,
+        | Fields::RawTags
+        | Fields::PathNodeIds
+        | Fields::EditOffsets
+        | Fields::EditBases => FieldType::VariableSized,
     }
 }
 
@@ -192,6 +229,9 @@ pub fn var_size_field_to_index(field: &Fields) -> Fields {
         Fields::RawSequence => Fields::RawSeqLen,
         Fields::RawTags => Fields::RawTagsLen,
         Fields::RawCigar => Fields::NCigar,
+        Fields::PathNodeIds => Fields::NodeCounts,
+        Fields::EditOffsets => Fields::EditCounts,
+        Fields::EditBases => Fields::EditBasesLen,
         _ => panic!("Unreachable"),
     }
 }

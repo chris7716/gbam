@@ -6,7 +6,7 @@ use crate::graph::path_codec::{compute_edits, encode_without_path, GraphPathEntr
 use crate::{SIZE_LIMIT, U32_SIZE};
 use bam_tools::record::bamrawrecord::{decode_seq, BAMRawRecord};
 use bam_tools::record::fields::{
-    field_type, is_data_field, var_size_field_to_index, FieldType, Fields, FIELDS_NUM,
+    field_type, is_data_field, var_size_field_to_index, FieldType, Fields,
 };
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use crc32fast::Hasher;
@@ -25,7 +25,6 @@ pub(crate) struct BlockInfo {
     pub numitems: u32,
     pub uncompr_size: usize,
     pub field: Fields,
-    // Interpretation is up to the reader.
     pub stats: Option<Stat>,
     pub codec: Codecs,
 }
@@ -58,7 +57,6 @@ pub static FIELD_CODEC_MAP: Lazy<HashMap<Fields, Codecs>> = Lazy::new(|| {
             "Lz4" => Codecs::Lz4,
             "Gzip" => Codecs::Gzip,
             "NoCompression" => Codecs::NoCompression,
-            "GraphPath" => Codecs::GraphPath,
             other => panic!("Unsupported codec: {}", other),
         };
         map.insert(field, codec);
@@ -66,15 +64,6 @@ pub static FIELD_CODEC_MAP: Lazy<HashMap<Fields, Codecs>> = Lazy::new(|| {
     map
 });
 
-/// The data is held in blocks.
-///
-/// Fixed sized fields are written as fixed size blocks into file. All blocks
-/// (for fixed size fields) except last one contain equal amount of data.
-///
-/// Variable sized fields are written as fixed size blocks. Blocks may contain
-/// different amount of data. Variable sized fields are accompanied by separate
-/// index in separate block for fixed size fields. Groups records before writing
-/// out to file.
 pub struct Writer<WS>
 where
     WS: Write + Seek,
@@ -82,6 +71,8 @@ where
     file_info: FileInfo,
     file_meta: FileMeta,
     columns: Vec<Box<dyn Column>>,
+    /// Present only for graph-path encoded files.
+    graph_bundle: Option<GraphPathBundle>,
     compressor: Compressor,
     inner: WS,
 }
@@ -106,35 +97,14 @@ where
             .seek(SeekFrom::Start((FILE_INFO_SIZE) as u64))
             .unwrap();
 
-        let mut columns = Vec::new();
-
-        let mut count = 0;
-        for field in Fields::iterator().filter(|f| is_data_field(f)) {
-            let stat_collector = collect_stats_for
-                .iter()
-                .find(|f| *f == field)
-                .and(Some(Stat::default()));
-            let col = match field_type(field) {
-                FieldType::FixedSized => {
-                    Box::new(FixedColumn::new(*field, stat_collector)) as Box<dyn Column>
-                }
-                FieldType::VariableSized => {
-                    // Index column +1.
-                    count += 1;
-                    Box::new(VariableColumn::new(*field, stat_collector)) as Box<dyn Column>
-                }
-            };
-            columns.push(col);
-            count += 1;
-        }
-        debug_assert!(count == FIELDS_NUM);
+        let columns = build_standard_columns(&collect_stats_for, false);
 
         Self {
-            // TODO: Codecs (currently only one is supported).
-            file_meta: FileMeta::new(codecs[0], ref_seqs, sam_header,  codec_map_required),
+            file_meta: FileMeta::new(codecs[0], ref_seqs, sam_header, codec_map_required),
             inner,
             compressor: Compressor::new(thread_num),
             columns,
+            graph_bundle: None,
             file_info: FileInfo::new([1, 0], 0, 0, full_command, is_sorted),
         }
     }
@@ -161,13 +131,8 @@ where
         )
     }
 
-    /// Construct a writer where the `RawSequence` column uses variation-graph
-    /// path encoding instead of raw 4-bit packed bases.
-    ///
-    /// `path_map` maps each read name (no null terminator) to its `PathInfo`
-    /// (node IDs + path_start offset), as produced by parsing a GAF file.
-    ///
-    /// All other columns use `codec` unchanged.
+    /// Construct a writer that stores read sequences in dedicated graph-path
+    /// columns (PathNodeIds, EditOffsets, EditBases, etc.) instead of RawSequence.
     pub fn new_with_graph(
         mut inner: WS,
         codec: Codecs,
@@ -184,46 +149,21 @@ where
             .seek(SeekFrom::Start(FILE_INFO_SIZE as u64))
             .unwrap();
 
-        let mut columns: Vec<Box<dyn Column>> = Vec::new();
-        let mut count = 0;
-
-        for field in Fields::iterator().filter(|f| is_data_field(f)) {
-            let col: Box<dyn Column> = if *field == Fields::RawSequence {
-                // Replace normal variable column with graph-path encoder.
-                count += 1; // index column counted internally
-                Box::new(GraphPathWriterColumn::new(graph.clone(), path_map.clone()))
-            } else {
-                match field_type(field) {
-                    FieldType::FixedSized => Box::new(FixedColumn::new(*field, None)),
-                    FieldType::VariableSized => {
-                        count += 1;
-                        Box::new(VariableColumn::new(*field, None))
-                    }
-                }
-            };
-            columns.push(col);
-            count += 1;
-        }
-        debug_assert!(count == FIELDS_NUM);
+        // Build standard columns but skip RawSequence (handled by graph bundle).
+        let columns = build_standard_columns_except(&[], true);
 
         Self {
             file_meta: FileMeta::new_with_graph(codec, ref_seqs, sam_header, pangenome_graph_uri),
             inner,
             compressor: Compressor::new(thread_num),
             columns,
+            graph_bundle: Some(GraphPathBundle::new(graph, path_map)),
             file_info: FileInfo::new([1, 0], 0, 0, full_command, is_sorted),
         }
     }
 
-    /// Push BAM record into this writer
     pub fn push_record(&mut self, record: &BAMRawRecord, codec_map_required: bool) {
-        // Index fields are not written on their own. They hold index data for variable sized fields.
         for col in self.columns.iter_mut() {
-            // Attempt to write data in this column. If the column is full it
-            // will return bytes for flushing. While loop is here because
-            // variable sized columns also have index columns (fixed size)
-            // inside and they might also come full and request flushing
-            // simultaneously with containing variable sized field column.
             while let WriteStatus::Full(inner) = col.write_record_field(record) {
                 flush_field_buffer(
                     &mut self.inner,
@@ -234,12 +174,20 @@ where
                 );
             }
         }
+        if self.graph_bundle.is_some() {
+            push_bundle_record(
+                self.graph_bundle.as_mut().unwrap(),
+                record,
+                &mut self.inner,
+                &mut self.file_meta,
+                &mut self.compressor,
+                codec_map_required,
+            );
+        }
     }
 
-    /// Terminates the writer. Always call after writting all the data. Returns
-    /// total amount of bytes written.
     pub fn finish(&mut self, codec_map_required: bool) -> std::io::Result<u64> {
-        // Flush leftovers
+        // Flush standard columns.
         let mut columns: Vec<Box<dyn Column>> = self.columns.drain(..).collect();
         for (inner, idx) in columns.iter_mut().map(|col| col.get_inners()) {
             let writer = &mut self.inner;
@@ -252,6 +200,16 @@ where
             }
         }
 
+        // Flush graph bundle columns.
+        if let Some(ref mut bundle) = self.graph_bundle {
+            bundle.flush_all(
+                &mut self.inner,
+                &mut self.file_meta,
+                &mut self.compressor,
+                codec_map_required,
+            );
+        }
+
         for mut task in self.compressor.finish() {
             if let OrderingKey::Key(key) = task.ordering_key {
                 write_data_and_update_meta(&mut self.inner, &mut self.file_meta, key, &mut task);
@@ -259,14 +217,12 @@ where
         }
 
         let meta_start_pos = self.inner.stream_position()?;
-        // Write meta
         let main_meta = serde_json::to_string(&self.file_meta).unwrap();
         let main_meta_bytes = main_meta.as_bytes();
         let crc32 = calc_crc_for_meta_bytes(main_meta_bytes);
         self.inner.write_all(main_meta_bytes)?;
 
         let total_bytes_written = self.inner.stream_position()?;
-        // Revert back to the beginning of the file
         self.inner.seek(SeekFrom::Start(0)).unwrap();
         self.inner.write_all(&[0; FILE_INFO_SIZE]).unwrap();
         self.inner.seek(SeekFrom::Start(0)).unwrap();
@@ -279,17 +235,221 @@ where
     }
 }
 
-fn flush_field_buffer<WS: Write + Seek>(
+/// Build the standard per-BAM-field column list, excluding graph-path fields.
+/// `skip_raw_sequence`: when true, omit RawSequence + its RawSeqLen index
+/// (used for graph-encoded writers where the bundle handles sequencing).
+fn build_standard_columns(
+    collect_stats_for: &[Fields],
+    skip_raw_sequence: bool,
+) -> Vec<Box<dyn Column>> {
+    let mut columns = Vec::new();
+    for field in Fields::iterator().filter(|f| is_data_field(f)) {
+        if skip_raw_sequence && *field == Fields::RawSequence {
+            continue;
+        }
+        let stat_collector = collect_stats_for
+            .iter()
+            .find(|f| *f == field)
+            .and(Some(Stat::default()));
+        let col = match field_type(field) {
+            FieldType::FixedSized => {
+                Box::new(FixedColumn::new(*field, stat_collector)) as Box<dyn Column>
+            }
+            FieldType::VariableSized => {
+                Box::new(VariableColumn::new(*field, stat_collector)) as Box<dyn Column>
+            }
+        };
+        columns.push(col);
+    }
+    columns
+}
+
+fn build_standard_columns_except(
+    _extra_skip: &[Fields],
+    skip_raw_sequence: bool,
+) -> Vec<Box<dyn Column>> {
+    build_standard_columns(&[], skip_raw_sequence)
+}
+
+// ---------------------------------------------------------------------------
+// Graph-path bundle: manages PathNodeIds, PathStart, EditOffsets, EditBases
+// ---------------------------------------------------------------------------
+
+struct GraphPathBundle {
+    path_start_inner: Inner,
+
+    node_ids_inner: Inner,
+    node_ids_idx_inner: Inner,
+
+    edit_offsets_inner: Inner,
+    edit_offsets_idx_inner: Inner,
+
+    edit_bases_inner: Inner,
+    edit_bases_idx_inner: Inner,
+
+    graph: Arc<VariationGraph>,
+    path_map: HashMap<String, PathInfo>,
+}
+
+impl GraphPathBundle {
+    fn new(graph: Arc<VariationGraph>, path_map: HashMap<String, PathInfo>) -> Self {
+        Self {
+            path_start_inner: Inner::new(Fields::PathStart, None),
+            node_ids_inner: Inner::new(Fields::PathNodeIds, None),
+            node_ids_idx_inner: Inner::new(Fields::NodeCounts, None),
+            edit_offsets_inner: Inner::new(Fields::EditOffsets, None),
+            edit_offsets_idx_inner: Inner::new(Fields::EditCounts, None),
+            edit_bases_inner: Inner::new(Fields::EditBases, None),
+            edit_bases_idx_inner: Inner::new(Fields::EditBasesLen, None),
+            graph,
+            path_map,
+        }
+    }
+
+    fn make_entry(&self, rec: &BAMRawRecord) -> GraphPathEntry {
+        let raw_seq_bytes = rec.get_bytes(&Fields::RawSequence);
+        let mut read_seq_str = String::new();
+        decode_seq(raw_seq_bytes, &mut read_seq_str);
+        let read_seq = read_seq_str.as_bytes();
+
+        let name_bytes = rec.get_bytes(&Fields::ReadName);
+        let name = std::str::from_utf8(
+            name_bytes.strip_suffix(b"\0").unwrap_or(name_bytes)
+        ).unwrap_or("");
+
+        let flag_bytes = rec.get_bytes(&Fields::Flags);
+        let flag = u16::from_le_bytes([flag_bytes[0], flag_bytes[1]]);
+        let suffix = if flag & 0x01 != 0 {
+            if flag & 0x40 != 0 { "/1" } else { "/2" }
+        } else {
+            ""
+        };
+
+        let path_info = if suffix.is_empty() {
+            self.path_map.get(name)
+        } else {
+            let suffixed = format!("{}{}", name, suffix);
+            self.path_map.get(suffixed.as_str()).or_else(|| self.path_map.get(name))
+        };
+
+        match path_info {
+            Some(info) => {
+                use crate::graph::gaf::REVERSE_BIT;
+                use crate::graph::path_codec::rev_comp;
+                let full_path_seq: Vec<u8> = info.node_ids
+                    .iter()
+                    .flat_map(|&encoded_id| {
+                        let is_reverse = encoded_id & REVERSE_BIT != 0;
+                        let node_id = encoded_id & !REVERSE_BIT;
+                        let seq = self.graph.node_seq(node_id).unwrap_or(&[]);
+                        if is_reverse { rev_comp(seq) } else { seq.to_vec() }
+                    })
+                    .collect();
+                let path_start = info.path_start as usize;
+                let aligned = full_path_seq.get(path_start..).unwrap_or(&[]);
+                let edits = compute_edits(aligned, read_seq);
+                GraphPathEntry::new(info.path_start, info.node_ids.clone(), edits)
+            }
+            None => encode_without_path(read_seq),
+        }
+    }
+
+    fn flush_all<WS: Write + Seek>(
+        &mut self,
+        writer: &mut WS,
+        file_meta: &mut FileMeta,
+        compressor: &mut Compressor,
+        codec_map_required: bool,
+    ) {
+        flush_field_buffer(writer, file_meta, compressor, &mut self.path_start_inner, codec_map_required);
+        flush_field_buffer(writer, file_meta, compressor, &mut self.node_ids_inner, codec_map_required);
+        flush_field_buffer(writer, file_meta, compressor, &mut self.node_ids_idx_inner, codec_map_required);
+        flush_field_buffer(writer, file_meta, compressor, &mut self.edit_offsets_inner, codec_map_required);
+        flush_field_buffer(writer, file_meta, compressor, &mut self.edit_offsets_idx_inner, codec_map_required);
+        flush_field_buffer(writer, file_meta, compressor, &mut self.edit_bases_inner, codec_map_required);
+        flush_field_buffer(writer, file_meta, compressor, &mut self.edit_bases_idx_inner, codec_map_required);
+    }
+}
+
+fn push_bundle_record<WS: Write + Seek>(
+    bundle: &mut GraphPathBundle,
+    rec: &BAMRawRecord,
+    writer: &mut WS,
+    file_meta: &mut FileMeta,
+    compressor: &mut Compressor,
+    codec_map_required: bool,
+) {
+    let entry = bundle.make_entry(rec);
+    let is_raw_fallback = entry.node_ids.is_empty();
+
+    // PathStart (fixed u32)
+    let ps_bytes = entry.path_start.to_le_bytes();
+    if bundle.path_start_inner.flush_required(&ps_bytes) {
+        flush_field_buffer(writer, file_meta, compressor, &mut bundle.path_start_inner, codec_map_required);
+    }
+    bundle.path_start_inner.write_data(&ps_bytes);
+
+    // PathNodeIds (variable) + NodeCounts index
+    let node_ids_bytes: Vec<u8> = if is_raw_fallback {
+        Vec::new()
+    } else {
+        entry.node_ids.iter().flat_map(|&id| id.to_le_bytes()).collect()
+    };
+    let mut idx_buf = [0u8; U32_SIZE];
+    if bundle.node_ids_idx_inner.flush_required(&idx_buf) {
+        flush_field_buffer(writer, file_meta, compressor, &mut bundle.node_ids_idx_inner, codec_map_required);
+    }
+    if bundle.node_ids_inner.flush_required(&node_ids_bytes) {
+        flush_field_buffer(writer, file_meta, compressor, &mut bundle.node_ids_inner, codec_map_required);
+    }
+    bundle.node_ids_inner.write_data(&node_ids_bytes);
+    (&mut idx_buf[..]).write_u32::<LittleEndian>(bundle.node_ids_inner.offset as u32).unwrap();
+    bundle.node_ids_idx_inner.write_data(&idx_buf);
+
+    // EditOffsets (variable) + EditCounts index
+    // Raw fallback: no offsets stored (positions are implicit 0..seq_len).
+    let edit_offsets_bytes: Vec<u8> = if is_raw_fallback {
+        Vec::new()
+    } else {
+        entry.edits.iter().flat_map(|e| e.read_offset.to_le_bytes()).collect()
+    };
+    if bundle.edit_offsets_idx_inner.flush_required(&idx_buf) {
+        flush_field_buffer(writer, file_meta, compressor, &mut bundle.edit_offsets_idx_inner, codec_map_required);
+    }
+    if bundle.edit_offsets_inner.flush_required(&edit_offsets_bytes) {
+        flush_field_buffer(writer, file_meta, compressor, &mut bundle.edit_offsets_inner, codec_map_required);
+    }
+    bundle.edit_offsets_inner.write_data(&edit_offsets_bytes);
+    (&mut idx_buf[..]).write_u32::<LittleEndian>(bundle.edit_offsets_inner.offset as u32).unwrap();
+    bundle.edit_offsets_idx_inner.write_data(&idx_buf);
+
+    // EditBases (variable) + EditBasesLen index
+    // For graph-path reads: sparse edit bases.
+    // For raw fallback: all bases stored here directly.
+    let edit_bases_bytes: Vec<u8> = entry.edits.iter().map(|e| e.read_base).collect();
+    if bundle.edit_bases_idx_inner.flush_required(&idx_buf) {
+        flush_field_buffer(writer, file_meta, compressor, &mut bundle.edit_bases_idx_inner, codec_map_required);
+    }
+    if bundle.edit_bases_inner.flush_required(&edit_bases_bytes) {
+        flush_field_buffer(writer, file_meta, compressor, &mut bundle.edit_bases_inner, codec_map_required);
+    }
+    bundle.edit_bases_inner.write_data(&edit_bases_bytes);
+    (&mut idx_buf[..]).write_u32::<LittleEndian>(bundle.edit_bases_inner.offset as u32).unwrap();
+    bundle.edit_bases_idx_inner.write_data(&idx_buf);
+}
+
+// ---------------------------------------------------------------------------
+// Shared infrastructure
+// ---------------------------------------------------------------------------
+
+pub(crate) fn flush_field_buffer<WS: Write + Seek>(
     writer: &mut WS,
     file_meta: &mut FileMeta,
     compressor: &mut Compressor,
     inner: &mut Inner,
     codec_map_required: bool
 ) {
-    // Use an empty buffer to start the flushing process
-    // Don't worry, Vec::new() is temporary, it won't need to fully allocate the Vec as it replaces the reference with the &mut from the reused Buffer
     let data = std::mem::take(&mut inner.buffer);
-
     let field = &inner.field;
     let codec = *file_meta.get_field_codec(field);
 
@@ -305,9 +465,7 @@ fn flush_field_buffer<WS: Write + Seek>(
         write_data_and_update_meta(writer, file_meta, key, &mut completed_task);
     }
 
-    // We need to reuse the same buffer for the next task, as it is always the same size so we can avoid re-allocating the same buffer for each processed block
     inner.buffer = completed_task.buf;
-
     inner.reset_for_new_block();
 }
 
@@ -331,7 +489,6 @@ fn write_data_and_update_meta<WS: Write + Seek>(
         field_meta.resize(key as usize + 1, BlockMeta::default());
     }
 
-    // Order as came in
     field_meta[key as usize] = meta;
 }
 
@@ -352,15 +509,14 @@ fn generate_meta<S: Seek>(
 
 enum WriteStatus<'a> {
     Written,
-    // Column or its index is at capacity. Flush it.
     Full(&'a mut Inner),
 }
 
-struct Inner {
+pub(crate) struct Inner {
     stats_collector: Option<Stat>,
-    buffer: Vec<u8>,
-    offset: usize,
-    field: Fields,
+    pub(crate) buffer: Vec<u8>,
+    pub(crate) offset: usize,
+    pub(crate) field: Fields,
     rec_count: u32,
     block_num: u64,
 }
@@ -377,7 +533,6 @@ impl Inner {
         }
     }
     pub fn write_data(&mut self, data: &[u8]) -> WriteStatus {
-        // At this point everything should be flushed.
         debug_assert!(!self.flush_required(data));
 
         let limit = std::cmp::max(data.len(), SIZE_LIMIT);
@@ -387,14 +542,12 @@ impl Inner {
 
         self.buffer[self.offset..self.offset + data.len()].clone_from_slice(data);
         self.offset += data.len();
-
         self.rec_count += 1;
 
         WriteStatus::Written
     }
 
     pub fn flush_required(&self, data: &[u8]) -> bool {
-        // At least one record will be written in even if it exceeds SIZE_LIMIT.
         self.offset > 0 && self.offset + data.len() > SIZE_LIMIT
     }
 
@@ -411,26 +564,23 @@ impl Inner {
             None
         };
         if codec_map_required {
-            codec = *FIELD_CODEC_MAP.get(&self.field).expect("Missing codec mapping");
+            codec = FIELD_CODEC_MAP.get(&self.field).copied().unwrap_or(codec);
         }
         BlockInfo {
             numitems: self.rec_count,
             uncompr_size: self.offset,
             field: self.field,
             stats: stat,
-            codec: codec,
+            codec,
         }
     }
 }
 
 trait Column {
-    // Extracts and writes data from corresponding BAMRawRecord record.
     fn write_record_field(&mut self, rec: &BAMRawRecord) -> WriteStatus;
-
     fn get_inners(&mut self) -> (&mut Inner, Option<&mut Inner>);
 }
 
-/// Column containing fixed sized fields.
 struct FixedColumn(Inner);
 
 impl FixedColumn {
@@ -510,152 +660,11 @@ impl Column for VariableColumn {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Graph-path writer column
-// ---------------------------------------------------------------------------
-
-/// Replaces the standard `VariableColumn` for `RawSequence` when graph-path
-/// encoding is requested.
-///
-/// On each `write_record_field` call it:
-/// 1. Extracts the read name from the BAM record.
-/// 2. Looks up the pre-computed path (node IDs) in `path_map`.
-/// 3. Reconstructs the path sequence from the graph and computes edits against
-///    the actual 4-bit decoded read sequence.
-/// 4. Serialises the `GraphPathEntry` and writes it to the internal buffer,
-///    using the same variable-length indexing scheme as `VariableColumn`.
-///
-/// Reads absent from `path_map` (e.g. unmapped reads) fall back to
-/// `encode_without_path`, which stores every base as an edit. This is
-/// lossless but storage-inefficient for truly unmapped reads.
-struct GraphPathWriterColumn {
-    /// Buffer and bookkeeping for the path+edits byte stream.
-    inner: Inner,
-    /// Cumulative offset index (mirrors VariableColumn index).
-    index: FixedColumn,
-    /// Shared, immutable variation graph.
-    graph: Arc<VariationGraph>,
-    /// read_name (no null terminator) → PathInfo (node IDs + path_start).
-    path_map: HashMap<String, PathInfo>,
-}
-
-impl GraphPathWriterColumn {
-    pub fn new(
-        graph: Arc<VariationGraph>,
-        path_map: HashMap<String, PathInfo>,
-    ) -> Self {
-        Self {
-            inner: Inner::new(Fields::RawSequence, None),
-            index: FixedColumn::new(Fields::RawSeqLen, None),
-            graph,
-            path_map,
-        }
-    }
-
-    /// Extract the read name from a BAM record as a clean UTF-8 string.
-    ///
-    /// BAM stores the read name null-terminated; we strip the `\0` before
-    /// using it as a map key.
-    fn read_name<'a>(rec: &'a BAMRawRecord<'a>) -> &'a str {
-        let bytes = rec.get_bytes(&Fields::ReadName);
-        let trimmed = bytes.strip_suffix(b"\0").unwrap_or(bytes);
-        std::str::from_utf8(trimmed).unwrap_or("")
-    }
-
-    /// Build a `GraphPathEntry` for one BAM record.
-    fn make_entry(&self, rec: &BAMRawRecord) -> GraphPathEntry {
-        // Decode the BAM 4-bit packed sequence to ASCII.
-        let raw_seq_bytes = rec.get_bytes(&Fields::RawSequence);
-        let mut read_seq_str = String::new();
-        decode_seq(raw_seq_bytes, &mut read_seq_str);
-        let read_seq = read_seq_str.as_bytes();
-
-        let name = Self::read_name(rec);
-
-        // Determine the paired-end suffix used by `samtools fastq` (/1 or /2)
-        // from the BAM FLAG field, so we look up the correct per-mate path.
-        // FLAG bit 0x01: read is paired; 0x40: first in pair; 0x80: second.
-        let flag_bytes = rec.get_bytes(&Fields::Flags);
-        let flag = u16::from_le_bytes([flag_bytes[0], flag_bytes[1]]);
-        let suffix = if flag & 0x01 != 0 {
-            if flag & 0x40 != 0 { "/1" } else { "/2" }
-        } else {
-            ""
-        };
-
-        // Try name+suffix first; fall back to bare name (handles unpaired reads
-        // or GAF files that don't carry the /1 /2 convention).
-        let path_info = if suffix.is_empty() {
-            self.path_map.get(name)
-        } else {
-            let suffixed = format!("{}{}", name, suffix);
-            self.path_map.get(suffixed.as_str()).or_else(|| self.path_map.get(name))
-        };
-
-        match path_info {
-            Some(info) => {
-                use crate::graph::gaf::REVERSE_BIT;
-                use crate::graph::path_codec::rev_comp;
-                // Build full path sequence with correct orientation per node.
-                let full_path_seq: Vec<u8> = info.node_ids
-                    .iter()
-                    .flat_map(|&encoded_id| {
-                        let is_reverse = encoded_id & REVERSE_BIT != 0;
-                        let node_id = encoded_id & !REVERSE_BIT;
-                        let seq = self.graph.node_seq(node_id).unwrap_or(&[]);
-                        if is_reverse { rev_comp(seq) } else { seq.to_vec() }
-                    })
-                    .collect();
-                // Skip path_start bytes before comparing with the read.
-                let path_start = info.path_start as usize;
-                let aligned = full_path_seq.get(path_start..).unwrap_or(&[]);
-                let edits = compute_edits(aligned, read_seq);
-                GraphPathEntry::new(
-                    read_seq.len() as u32,
-                    info.path_start,
-                    info.node_ids.clone(),
-                    edits,
-                )
-            }
-            None => encode_without_path(read_seq),
-        }
-    }
-}
-
-impl Column for GraphPathWriterColumn {
-    fn write_record_field(&mut self, rec: &BAMRawRecord) -> WriteStatus {
-        let encoded = self.make_entry(rec).to_bytes();
-
-        let index_inner = &mut self.index.0;
-        let inner = &mut self.inner;
-        let mut idx_buf: [u8; U32_SIZE] = [0; U32_SIZE];
-
-        if index_inner.flush_required(&idx_buf) {
-            return WriteStatus::Full(index_inner);
-        }
-        if inner.flush_required(&encoded) {
-            return WriteStatus::Full(inner);
-        }
-
-        inner.write_data(&encoded);
-        (&mut idx_buf[..])
-            .write_u32::<LittleEndian>(u32::try_from(inner.offset).unwrap())
-            .unwrap();
-        index_inner.write_data(&idx_buf)
-    }
-
-    fn get_inners(&mut self) -> (&mut Inner, Option<&mut Inner>) {
-        (&mut self.inner, Some(&mut self.index.0))
-    }
-}
-
 impl<W> Write for Writer<W>
 where
     W: Write + Seek,
 {
     /// WARNING: ENSURE THAT BUF CONTAINS A ONE FULL RECORD.
-    /// TODO: Implement a proper trait and use it instead of Write in bam_sorting.
-    /// Write trait implementation is made to allow passing Write trait objects to sort function in BAM parallel.
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         assert!(!buf.is_empty());
         let wrapper = BAMRawRecord(Cow::Borrowed(buf));
@@ -668,59 +677,8 @@ where
     }
 }
 
-// TODO: Currently end user should manually call finish. Probably can be done
-// with a drop. If drop and manual finish used simultaneously, crc32 and meta of
-// file will be damaged.
-// impl<W> Drop for Writer<W>
-// where
-//     W: Write + Seek,
-// {
-//     fn drop(&mut self) {
-//         self.finish().unwrap();
-//     }
-// }
-
 pub(crate) fn calc_crc_for_meta_bytes(bytes: &[u8]) -> u32 {
     let mut hasher = Hasher::new();
     hasher.update(bytes);
     hasher.finalize()
 }
-
-// #[ignore]
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-//     use crate::reader::parse_tmplt::*;
-//     use crate::reader::reader::*;
-//     use byteorder::ReadBytesExt;
-//     use std::io::Cursor;
-//     #[test]
-//     fn test_writer() {
-//         // let raw_records = vec![BAMRawRecord::default(); 2];
-//         // let mut buf: Vec<u8> = vec![0; SIZE_LIMIT];
-//         // let out = Cursor::new(&mut buf[..]);
-//         // let mut writer = Writer::new(out, Codecs::Gzip, 8);
-//         // for rec in raw_records.iter() {
-//         //     writer.push_record(rec);
-//         // }
-//         // let total_bytes_written = writer.finish().unwrap();
-//         // buf.resize(total_bytes_written as usize, 0);
-
-//         // let in_cursor = Box::new(Cursor::new(buf));
-//         // let mut parsing_template = ParsingTemplate::new();
-//         // parsing_template.set_all();
-//         // let mut reader = Reader::new(in_cursor, parsing_template).unwrap();
-//         // let mut records = reader.records();
-//         // let mut it = raw_records.iter();
-//         // while let Some(rec) = records.next_rec() {
-//         //     let rec_orig = it.next().unwrap();
-//         //     let orig_map_q = rec_orig.get_bytes(&Fields::Mapq)[0];
-//         //     let orig_pos = rec_orig
-//         //         .get_bytes(&Fields::Pos)
-//         //         .read_i32::<LittleEndian>()
-//         //         .unwrap();
-//         //     assert_eq!(rec.pos.unwrap(), orig_pos);
-//         //     assert_eq!(rec.mapq.unwrap(), orig_map_q);
-//         // }
-//     }
-// }

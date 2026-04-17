@@ -179,19 +179,6 @@ pub fn compress(source: &[u8], mut dest: Vec<u8>, codec: Codecs) -> Vec<u8> {
             dest.extend_from_slice(source);
             Ok(dest)
         }
-        // GraphPath data (path node IDs + sparse edits) is compressed with
-        // Brotli. On a real pangenome graph, node IDs repeat heavily across
-        // reads and compress very well. On a synthetic/trivial graph the gain
-        // is smaller but still better than storing raw integers.
-        Codecs::GraphPath => {
-            dest.clear();
-            {
-                let mut writer = CompressorWriter::new(&mut dest, 4096, 8, 22);
-                writer.write_all(source).unwrap();
-                writer.flush().unwrap();
-            }
-            Ok(dest)
-        }
     };
     compressed_bytes.unwrap()
 }

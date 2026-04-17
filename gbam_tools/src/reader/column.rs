@@ -10,20 +10,18 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use flate2::write::GzDecoder;
 use lzzzz::lz4;
 use memmap2::Mmap;
-use std::convert::TryFrom;
-use std::io::{Read, Write};
+use std::convert::{TryFrom, TryInto};
+use std::io::Read;
 use xz2::read::XzDecoder;
 
 use crate::{meta::FileMeta, Codecs};
 
-// Contains fields needed both for fixed sized fields and variable sized fields.
 pub struct Inner {
-    /// Arc is needed since this struct should work with PyO3 which sends struct between threads (Send trait is required).
-    meta: Arc<FileMeta>,
+    pub(crate) meta: Arc<FileMeta>,
     range_begin: usize,
     range_end: usize,
-    field: Fields,
-    buffer: Vec<u8>,
+    pub(crate) field: Fields,
+    pub(crate) buffer: Vec<u8>,
     reader: Arc<Mmap>,
 }
 
@@ -40,20 +38,13 @@ impl Inner {
     }
 }
 
-/// Defines how columns will operate. It is needed since variable sized fields
-/// columns also require parsing of additional fixed sized fields columns.
 pub trait Column {
-    // Fills GbamRecord field with data from corresponding BAM record.
     fn fill_record_field(&mut self, item_num: usize, rec: &mut GbamRecord);
 }
 
-/// GBAM file column. Responsible for fetching data.
-pub struct FixedColumn(Inner, usize);
+pub struct FixedColumn(pub(crate) Inner, pub(crate) usize);
 
 impl Column for FixedColumn {
-    /// Fetches data into provider record buffer. If item is located outside of
-    /// currently loaded data block, the new block will be loaded and
-    /// decompressed.
     fn fill_record_field(&mut self, item_num: usize, rec: &mut GbamRecord) {
         rec.parse_from_bytes(&self.0.field.clone(), self.get_item(item_num));
     }
@@ -63,7 +54,8 @@ impl FixedColumn {
     pub fn new(inner: Inner, field_size: usize) -> Self {
         Self(inner, field_size)
     }
-    fn get_item(&mut self, item_num: usize) -> &[u8] {
+
+    pub(crate) fn get_item(&mut self, item_num: usize) -> &[u8] {
         if let Some(block_num) = self.find_block(item_num) {
             Self::update_buffer(&mut self.0, block_num);
         }
@@ -72,12 +64,11 @@ impl FixedColumn {
         let offset = rec_num_in_block * item_size;
         &self.0.buffer[offset..offset + item_size]
     }
-    // Finds blocks where record is located. None is returned if block is already loaded.
+
     fn find_block(&self, item_num: usize) -> Option<usize> {
         if item_num >= self.0.range_begin && item_num < self.0.range_end {
             return None;
         }
-        // All blocks sizes are equal except maybe the last one since it's a fixed sized column and block size limit is constant.
         let block_len = self.0.meta.view_blocks(&self.0.field)[0].numitems;
         Some(item_num / block_len as usize)
     }
@@ -91,11 +82,9 @@ impl FixedColumn {
     }
 }
 
-/// Column managing access to variable sized data. Utilizes another column (for fixed sized fields) to index data.
 pub struct VariableColumn {
-    inner: Inner,
-    index: FixedColumn,
-    // Used to quickly determine what block record belongs to.
+    pub(crate) inner: Inner,
+    pub(crate) index: FixedColumn,
     blocks: BTreeMap<usize, usize>,
 }
 
@@ -114,7 +103,7 @@ impl VariableColumn {
         }
     }
 
-    fn get_item(&mut self, item_num: usize) -> &[u8] {
+    pub(crate) fn get_item(&mut self, item_num: usize) -> &[u8] {
         if let Some((range_begin, block_num)) = self.find_block(item_num) {
             Self::update_buffer(&mut self.inner, block_num, range_begin);
         }
@@ -129,15 +118,12 @@ impl VariableColumn {
         &self.inner.buffer[start..end]
     }
 
-    // Finds blocks where record is located. None is returned if block is already loaded.
     fn find_block(&self, item_num: usize) -> Option<(usize, usize)> {
         if item_num >= self.inner.range_begin && item_num < self.inner.range_end {
             return None;
         }
-        // To determine what block record N is in.
         Some(
             self.blocks
-                // Inclusive range.
                 .range(..=item_num)
                 .next_back()
                 .map_or((0, 0), |(&range_begin, &block_num)| {
@@ -154,9 +140,7 @@ impl VariableColumn {
     }
 }
 
-/// Fetch and decompress a data block.
 fn fetch_block(inner_column: &mut Inner, block_num: usize) -> Result<()> {
-    // println!("Fetching for {}", inner_column.field);
     let field = &inner_column.field;
     let block_meta = inner_column.meta.view_blocks(field).get(block_num).unwrap();
     let reader = &inner_column.reader;
@@ -165,8 +149,6 @@ fn fetch_block(inner_column: &mut Inner, block_num: usize) -> Result<()> {
 
     let data = &reader[usize::try_from(block_meta.seekpos).unwrap()
         ..usize::try_from(block_meta.seekpos + block_size as u64).unwrap()];
-    // inner_column.buffer.clear();
-    // dbg!(uncompressed_size);
     inner_column.buffer.resize(uncompressed_size as usize, 0);
     let codec = inner_column.meta.get_field_codec(field);
 
@@ -206,87 +188,86 @@ pub fn decompress_block(source: &[u8], dest: &mut Vec<u8>, codec: &Codecs) -> st
             dest.clear();
             dest.extend_from_slice(source);
         }
-        // GraphPath blocks are compressed with Brotli (same as the writer).
-        Codecs::GraphPath => {
-            dest.clear();
-            let mut decompressor = brotli::Decompressor::new(source, 4096);
-            decompressor.read_to_end(dest)?;
-        }
     };
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// Graph-path reader column
+// Graph-path sequence column
 // ---------------------------------------------------------------------------
 
-/// Column that reads graph-path encoded `RawSequence` data and reconstructs
-/// the ASCII read sequence on demand using the shared `VariationGraph`.
-///
-/// The internal buffer and offset-index work identically to `VariableColumn`;
-/// the only difference is how `fill_record_field` interprets the raw bytes.
-pub struct GraphPathReaderColumn {
-    inner: Inner,
-    index: FixedColumn,
-    blocks: BTreeMap<usize, usize>,
+/// Reads the dedicated graph-path columns (PathNodeIds, PathStart, EditOffsets,
+/// EditBases) and reconstructs the ASCII read sequence for `RawSequence` requests.
+pub struct GraphPathSequenceColumn {
+    path_start_col: FixedColumn,
+    node_ids_col: VariableColumn,
+    edit_offsets_col: VariableColumn,
+    edit_bases_col: VariableColumn,
+    seq_len_col: FixedColumn,
     graph: Arc<VariationGraph>,
 }
 
-impl GraphPathReaderColumn {
-    pub fn new(inner: Inner, index: FixedColumn, graph: Arc<VariationGraph>) -> Self {
+impl GraphPathSequenceColumn {
+    pub fn new(
+        path_start_col: FixedColumn,
+        node_ids_col: VariableColumn,
+        edit_offsets_col: VariableColumn,
+        edit_bases_col: VariableColumn,
+        seq_len_col: FixedColumn,
+        graph: Arc<VariationGraph>,
+    ) -> Self {
         Self {
-            blocks: generate_block_treemap(&inner.meta, &inner.field),
-            inner,
-            index,
+            path_start_col,
+            node_ids_col,
+            edit_offsets_col,
+            edit_bases_col,
+            seq_len_col,
             graph,
         }
     }
-
-    fn get_item(&mut self, item_num: usize) -> &[u8] {
-        if let Some((range_begin, block_num)) = self.find_block(item_num) {
-            Self::update_buffer(&mut self.inner, block_num, range_begin);
-        }
-        let rec_num_in_block = item_num - self.inner.range_begin;
-        let mut read_offset =
-            |n| self.index.get_item(n).read_u32::<LittleEndian>().unwrap() as usize;
-        let start = match rec_num_in_block {
-            0 => 0,
-            _ => read_offset(item_num - 1),
-        };
-        let end = read_offset(item_num);
-        &self.inner.buffer[start..end]
-    }
-
-    fn find_block(&self, item_num: usize) -> Option<(usize, usize)> {
-        if item_num >= self.inner.range_begin && item_num < self.inner.range_end {
-            return None;
-        }
-        Some(
-            self.blocks
-                .range(..=item_num)
-                .next_back()
-                .map_or((0, 0), |(&range_begin, &block_num)| {
-                    (range_begin, block_num)
-                }),
-        )
-    }
-
-    fn update_buffer(inner: &mut Inner, block_num: usize, range_begin: usize) {
-        fetch_block(inner, block_num).unwrap();
-        let block_len = inner.meta.view_blocks(&inner.field)[block_num].numitems as usize;
-        inner.range_begin = range_begin;
-        inner.range_end = inner.range_begin + block_len;
-    }
 }
 
-impl Column for GraphPathReaderColumn {
-    /// Decode the graph-path entry for `item_num` and write the reconstructed
-    /// ASCII sequence directly into `rec.seq`.
+impl Column for GraphPathSequenceColumn {
     fn fill_record_field(&mut self, item_num: usize, rec: &mut GbamRecord) {
-        let bytes = self.get_item(item_num);
-        let entry =
-            GraphPathEntry::from_bytes(bytes).expect("Corrupt GraphPath data in RawSequence column");
-        let ascii_seq = entry.reconstruct_sequence(&self.graph);
-        rec.seq = Some(String::from_utf8(ascii_seq).unwrap_or_default());
+        let seq_len = {
+            let bytes = self.seq_len_col.get_item(item_num);
+            u32::from_le_bytes(bytes.try_into().unwrap()) as usize
+        };
+
+        let path_start = {
+            let bytes = self.path_start_col.get_item(item_num);
+            u32::from_le_bytes(bytes.try_into().unwrap())
+        };
+
+        let node_ids_bytes = self.node_ids_col.get_item(item_num).to_vec();
+
+        let seq = if node_ids_bytes.is_empty() {
+            // Raw fallback: EditBases holds the full sequence directly.
+            self.edit_bases_col.get_item(item_num).to_vec()
+        } else {
+            let node_ids: Vec<u32> = node_ids_bytes
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+
+            let edit_offsets_bytes = self.edit_offsets_col.get_item(item_num).to_vec();
+            let edit_bases = self.edit_bases_col.get_item(item_num).to_vec();
+
+            let edits: Vec<_> = edit_bases
+                .iter()
+                .enumerate()
+                .map(|(i, &base)| {
+                    let offset = u32::from_le_bytes(
+                        edit_offsets_bytes[i * 4..i * 4 + 4].try_into().unwrap()
+                    );
+                    crate::graph::path_codec::Edit { read_offset: offset, read_base: base }
+                })
+                .collect();
+
+            let entry = GraphPathEntry::new(path_start, node_ids, edits);
+            entry.reconstruct_sequence(&self.graph, seq_len)
+        };
+
+        rec.seq = Some(String::from_utf8(seq).unwrap_or_default());
     }
 }

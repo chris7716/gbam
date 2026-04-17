@@ -16,5 +16,12 @@
   "NCigar": "Brotli",
   "SequenceLength": "Brotli",
   "RawTagsLen": "Brotli",
-  "RawSeqLen": "Brotli"
+  "RawSeqLen": "Brotli",
+  "PathNodeIds": "Brotli",
+  "PathStart": "Brotli",
+  "EditOffsets": "Brotli",
+  "EditBases": "Brotli",
+  "NodeCounts": "Brotli",
+  "EditCounts": "Brotli",
+  "EditBasesLen": "Brotli"
 }

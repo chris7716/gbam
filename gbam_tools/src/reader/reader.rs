@@ -9,11 +9,11 @@ use memmap2::Mmap;
 use memmap2::MmapOptions;
 
 use crate::graph::gfa::VariationGraph;
-use crate::meta::{BlockMeta, Codecs, FileInfo, FileMeta, FILE_INFO_SIZE};
+use crate::meta::{BlockMeta, FileInfo, FileMeta, FILE_INFO_SIZE};
 use crate::writer::calc_crc_for_meta_bytes;
 
 use super::{
-    column::{Column, FixedColumn, GraphPathReaderColumn, Inner, VariableColumn},
+    column::{Column, FixedColumn, GraphPathSequenceColumn, Inner, VariableColumn},
     parse_tmplt::ParsingTemplate,
     record::GbamRecord,
     records::Records,
@@ -171,18 +171,33 @@ fn init_col(
     meta: &Arc<FileMeta>,
     graph: Option<Arc<VariationGraph>>,
 ) -> Box<dyn Column + Send> {
-    // If this field uses GraphPath encoding, use the specialised reader column.
-    if field == Fields::RawSequence && *meta.get_field_codec(&field) == Codecs::GraphPath {
-        let inner = Inner::new(meta.clone(), field, mmap.clone());
-        let idx_field = var_size_field_to_index(&field); // RawSeqLen
-        let idx_inner = Inner::new(meta.clone(), idx_field, mmap.clone());
-        let idx_col =
-            FixedColumn::new(idx_inner, meta.get_field_size(&idx_field).unwrap() as usize);
+    // Graph-path encoded files store sequences in dedicated columns.
+    if field == Fields::RawSequence && meta.pangenome_graph_uri.is_some() {
         let graph = graph.expect(
-            "A VariationGraph must be supplied when reading a GraphPath-encoded GBAM file. \
+            "A VariationGraph must be supplied when reading a graph-path encoded GBAM file. \
              Use Reader::new_with_graph.",
         );
-        return Box::new(GraphPathReaderColumn::new(inner, idx_col, graph));
+
+        let make_fixed = |f: Fields| {
+            let inner = Inner::new(meta.clone(), f, mmap.clone());
+            FixedColumn::new(inner, meta.get_field_size(&f).unwrap() as usize)
+        };
+        let make_variable = |f: Fields| {
+            let inner = Inner::new(meta.clone(), f, mmap.clone());
+            let idx_field = var_size_field_to_index(&f);
+            let idx_inner = Inner::new(meta.clone(), idx_field, mmap.clone());
+            let idx_col = FixedColumn::new(idx_inner, meta.get_field_size(&idx_field).unwrap() as usize);
+            VariableColumn::new(inner, idx_col)
+        };
+
+        return Box::new(GraphPathSequenceColumn::new(
+            make_fixed(Fields::PathStart),
+            make_variable(Fields::PathNodeIds),
+            make_variable(Fields::EditOffsets),
+            make_variable(Fields::EditBases),
+            make_fixed(Fields::SequenceLength),
+            graph,
+        ));
     }
 
     let inner = Inner::new(meta.clone(), field, mmap.clone());

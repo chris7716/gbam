@@ -59,13 +59,6 @@ pub enum Codecs {
     Xz,
     /// No compression
     NoCompression,
-    /// Variation graph path encoding (valid only for the RawSequence column).
-    ///
-    /// Data is stored as (seq_len, path_node_ids[], edits[]) rather than
-    /// 4-bit packed bases. No additional byte-level compression is applied;
-    /// the integer-heavy encoding compresses well with a second-pass codec if
-    /// needed. The pangenome graph must be available at decode time.
-    GraphPath,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -264,7 +257,7 @@ impl FileMeta {
         let mut map: [FieldMeta; FIELDS_NUM] = Default::default();
         for field in Fields::iterator() {
             if codec_map_required {
-                codec = *FIELD_CODEC_MAP.get(field).expect("Missing codec mapping");
+                codec = FIELD_CODEC_MAP.get(field).copied().unwrap_or(Codecs::Brotli);
             }
             map[*field as usize] = FieldMeta::new(field, codec);
         }
@@ -277,8 +270,9 @@ impl FileMeta {
         }
     }
 
-    /// Like `new`, but additionally records the pangenome graph URI and sets
-    /// the RawSequence column codec to `Codecs::GraphPath`.
+    /// Like `new`, but additionally records the pangenome graph URI.
+    /// Sequence data is stored in the dedicated graph path columns
+    /// (PathNodeIds, EditOffsets, EditBases, etc.) instead of RawSequence.
     pub fn new_with_graph(
         codec: Codecs,
         ref_seqs: Vec<(String, u32)>,
@@ -287,8 +281,6 @@ impl FileMeta {
     ) -> Self {
         let mut meta = Self::new(codec, ref_seqs, sam_header, false);
         meta.pangenome_graph_uri = Some(pangenome_graph_uri);
-        // Override the RawSequence column to use graph-path encoding
-        meta.field_to_meta[Fields::RawSequence as usize].codec = Codecs::GraphPath;
         meta
     }
 
