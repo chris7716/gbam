@@ -107,9 +107,6 @@ pub fn compute_edits(path_seq: &[u8], read_seq: &[u8]) -> Vec<Edit> {
 
     for i in 0..len {
         let r = read_seq[i].to_ascii_uppercase();
-        if r == b'N' {
-            continue;
-        }
         let p = if i < path_seq.len() {
             path_seq[i].to_ascii_uppercase()
         } else {
