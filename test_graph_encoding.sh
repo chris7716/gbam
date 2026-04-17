@@ -59,7 +59,7 @@ fi
 # vg sim generates reads that follow actual haplotype paths in the graph.
 # --align-out produces GAM with path annotations so we skip vg map entirely.
 echo "    Simulating 500k reads from graph haplotype paths..."
-"$VG" sim -x chr22.xg -n 500000 -l 150 -e 0.001 -i 0.0001 --align-out -t 8 > chr22_aln.gam
+"$VG" sim -x chr22.xg -n 3000000 -l 150 -e 0.001 -i 0.0001 --align-out -t 8 > chr22_aln.gam
 echo "    Reads simulated: $(wc -c < chr22_aln.gam) bytes (GAM)"
 
 echo "==> [7/9] Converting GAM to GAF and BAM..."
