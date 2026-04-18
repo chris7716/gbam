@@ -13,7 +13,7 @@ use crate::meta::{BlockMeta, FileInfo, FileMeta, FILE_INFO_SIZE};
 use crate::writer::calc_crc_for_meta_bytes;
 
 use super::{
-    column::{Column, FixedColumn, GraphPathSequenceColumn, Inner, VariableColumn},
+    column::{Column, FixedColumn, GraphPathSequenceColumn, Inner, ScaledVariableColumn, VariableColumn},
     parse_tmplt::ParsingTemplate,
     record::GbamRecord,
     records::Records,
@@ -189,12 +189,19 @@ fn init_col(
             let idx_col = FixedColumn::new(idx_inner, meta.get_field_size(&idx_field).unwrap() as usize);
             VariableColumn::new(inner, idx_col)
         };
+        // EditBases uses EditCounts as index but with scale factor 4 (u32 offset -> u8 offset)
+        let make_edit_bases = || {
+            let inner = Inner::new(meta.clone(), Fields::EditBases, mmap.clone());
+            let idx_inner = Inner::new(meta.clone(), Fields::EditCounts, mmap.clone());
+            let idx_col = FixedColumn::new(idx_inner, meta.get_field_size(&Fields::EditCounts).unwrap() as usize);
+            ScaledVariableColumn::new(inner, idx_col, 4)
+        };
 
         return Box::new(GraphPathSequenceColumn::new(
             make_fixed(Fields::PathStart),
             make_variable(Fields::PathNodeIds),
             make_variable(Fields::EditOffsets),
-            make_variable(Fields::EditBases),
+            make_edit_bases(),
             make_fixed(Fields::SequenceLength),
             graph,
         ));

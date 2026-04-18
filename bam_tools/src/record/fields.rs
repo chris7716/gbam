@@ -10,7 +10,7 @@ use std::str::FromStr;
 // To avoid visual clutter (no need to write Fields::* each time).
 use self::Fields::*;
 
-pub const FIELDS_NUM: usize = 25;
+pub const FIELDS_NUM: usize = 24;
 /// Fields which contain data (not index fields).
 #[allow(dead_code)]
 pub const DATA_FIELDS_NUM: usize = 13;
@@ -46,8 +46,7 @@ pub enum Fields {
     EditOffsets,  // = 20, variable: flat stream of edit positions per read
     EditBases,    // = 21, variable: flat stream of edit bases per read
     NodeCounts,   // = 22, fixed u32: cumulative byte offset index for PathNodeIds
-    EditCounts,   // = 23, fixed u32: cumulative byte offset index for EditOffsets
-    EditBasesLen, // = 24, fixed u32: cumulative byte offset index for EditBases
+    EditCounts,   // = 23, fixed u32: cumulative byte offset index for EditOffsets (also indexes EditBases via /4)
 }
 
 impl Fields {
@@ -81,7 +80,6 @@ impl Fields {
             EditBases,
             NodeCounts,
             EditCounts,
-            EditBasesLen,
         ];
         FIELDS.iter()
     }
@@ -116,7 +114,6 @@ impl FromStr for Fields {
             "EditBases" => Ok(Fields::EditBases),
             "NodeCounts" => Ok(Fields::NodeCounts),
             "EditCounts" => Ok(Fields::EditCounts),
-            "EditBasesLen" => Ok(Fields::EditBasesLen),
             _ => Err(()),
         }
     }
@@ -162,7 +159,6 @@ pub fn field_item_size(field: &Fields) -> Option<usize> {
         PathStart => Some(U32_SIZE),
         NodeCounts => Some(U32_SIZE),
         EditCounts => Some(U32_SIZE),
-        EditBasesLen => Some(U32_SIZE),
         ReadName => None,
         RawCigar => None,
         RawSequence => None,
@@ -207,8 +203,7 @@ pub fn field_type(field: &Fields) -> FieldType {
         | Fields::RawTagsLen
         | Fields::PathStart
         | Fields::NodeCounts
-        | Fields::EditCounts
-        | Fields::EditBasesLen => FieldType::FixedSized,
+        | Fields::EditCounts => FieldType::FixedSized,
         // Variable size fields
         Fields::ReadName
         | Fields::RawCigar
@@ -231,7 +226,7 @@ pub fn var_size_field_to_index(field: &Fields) -> Fields {
         Fields::RawCigar => Fields::NCigar,
         Fields::PathNodeIds => Fields::NodeCounts,
         Fields::EditOffsets => Fields::EditCounts,
-        Fields::EditBases => Fields::EditBasesLen,
+        Fields::EditBases => Fields::EditCounts, // EditBases uses EditCounts/4 as byte offset
         _ => panic!("Unreachable"),
     }
 }

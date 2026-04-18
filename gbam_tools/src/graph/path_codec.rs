@@ -13,7 +13,7 @@
 //! - `PathStart`    — one u32 per read
 //! - `EditOffsets`  — flat stream of per-edit read positions
 //! - `EditBases`    — flat stream of per-edit base values
-//! - Index columns `NodeCounts`, `EditCounts`, `EditBasesLen` delimit per-read slices.
+//! - Index columns `NodeCounts`, `EditCounts` delimit per-read slices (EditBases uses EditCounts/4).
 
 use super::gaf::REVERSE_BIT;
 use super::gfa::VariationGraph;

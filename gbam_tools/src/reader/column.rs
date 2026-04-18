@@ -140,6 +140,64 @@ impl VariableColumn {
     }
 }
 
+/// Like VariableColumn but divides index values by a scale factor.
+/// Used for EditBases which shares EditCounts index (stores u32 offsets) but contains u8 values.
+pub struct ScaledVariableColumn {
+    pub(crate) inner: Inner,
+    pub(crate) index: FixedColumn,
+    blocks: BTreeMap<usize, usize>,
+    scale: usize,
+}
+
+impl ScaledVariableColumn {
+    pub fn new(inner: Inner, index: FixedColumn, scale: usize) -> Self {
+        Self {
+            blocks: generate_block_treemap(&inner.meta, &inner.field),
+            inner,
+            index,
+            scale,
+        }
+    }
+
+    pub(crate) fn get_item(&mut self, item_num: usize) -> &[u8] {
+        if let Some((range_begin, block_num)) = self.find_block(item_num) {
+            Self::update_buffer(&mut self.inner, block_num, range_begin);
+        }
+        let rec_num_in_block = item_num - self.inner.range_begin;
+        let mut read_offset = |n| {
+            let raw = self.index.get_item(n).read_u32::<LittleEndian>().unwrap() as usize;
+            raw / self.scale
+        };
+        let start = match rec_num_in_block {
+            0 => 0,
+            _ => read_offset(item_num - 1),
+        };
+        let end = read_offset(item_num);
+        &self.inner.buffer[start..end]
+    }
+
+    fn find_block(&self, item_num: usize) -> Option<(usize, usize)> {
+        if item_num >= self.inner.range_begin && item_num < self.inner.range_end {
+            return None;
+        }
+        Some(
+            self.blocks
+                .range(..=item_num)
+                .next_back()
+                .map_or((0, 0), |(&range_begin, &block_num)| {
+                    (range_begin, block_num)
+                }),
+        )
+    }
+
+    fn update_buffer(inner: &mut Inner, block_num: usize, range_begin: usize) {
+        fetch_block(inner, block_num).unwrap();
+        let block_len = inner.meta.view_blocks(&inner.field)[block_num].numitems as usize;
+        inner.range_begin = range_begin;
+        inner.range_end = inner.range_begin + block_len;
+    }
+}
+
 fn fetch_block(inner_column: &mut Inner, block_num: usize) -> Result<()> {
     let field = &inner_column.field;
     let block_meta = inner_column.meta.view_blocks(field).get(block_num).unwrap();
@@ -202,7 +260,7 @@ pub struct GraphPathSequenceColumn {
     path_start_col: FixedColumn,
     node_ids_col: VariableColumn,
     edit_offsets_col: VariableColumn,
-    edit_bases_col: VariableColumn,
+    edit_bases_col: ScaledVariableColumn,
     seq_len_col: FixedColumn,
     graph: Arc<VariationGraph>,
 }
@@ -212,7 +270,7 @@ impl GraphPathSequenceColumn {
         path_start_col: FixedColumn,
         node_ids_col: VariableColumn,
         edit_offsets_col: VariableColumn,
-        edit_bases_col: VariableColumn,
+        edit_bases_col: ScaledVariableColumn,
         seq_len_col: FixedColumn,
         graph: Arc<VariationGraph>,
     ) -> Self {

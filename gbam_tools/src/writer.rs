@@ -285,7 +285,7 @@ struct GraphPathBundle {
     edit_offsets_idx_inner: Inner,
 
     edit_bases_inner: Inner,
-    edit_bases_idx_inner: Inner,
+    // EditBases index is derived from EditCounts (divided by 4), no separate index needed
 
     graph: Arc<VariationGraph>,
     path_map: HashMap<String, PathInfo>,
@@ -300,7 +300,6 @@ impl GraphPathBundle {
             edit_offsets_inner: Inner::new(Fields::EditOffsets, None),
             edit_offsets_idx_inner: Inner::new(Fields::EditCounts, None),
             edit_bases_inner: Inner::new(Fields::EditBases, None),
-            edit_bases_idx_inner: Inner::new(Fields::EditBasesLen, None),
             graph,
             path_map,
         }
@@ -367,7 +366,6 @@ impl GraphPathBundle {
         flush_field_buffer(writer, file_meta, compressor, &mut self.edit_offsets_inner, codec_map_required);
         flush_field_buffer(writer, file_meta, compressor, &mut self.edit_offsets_idx_inner, codec_map_required);
         flush_field_buffer(writer, file_meta, compressor, &mut self.edit_bases_inner, codec_map_required);
-        flush_field_buffer(writer, file_meta, compressor, &mut self.edit_bases_idx_inner, codec_map_required);
     }
 }
 
@@ -423,19 +421,14 @@ fn push_bundle_record<WS: Write + Seek>(
     (&mut idx_buf[..]).write_u32::<LittleEndian>(bundle.edit_offsets_inner.offset as u32).unwrap();
     bundle.edit_offsets_idx_inner.write_data(&idx_buf);
 
-    // EditBases (variable) + EditBasesLen index
+    // EditBases (variable) - index derived from EditCounts / 4
     // For graph-path reads: sparse edit bases.
     // For raw fallback: all bases stored here directly.
     let edit_bases_bytes: Vec<u8> = entry.edits.iter().map(|e| e.read_base).collect();
-    if bundle.edit_bases_idx_inner.flush_required(&idx_buf) {
-        flush_field_buffer(writer, file_meta, compressor, &mut bundle.edit_bases_idx_inner, codec_map_required);
-    }
     if bundle.edit_bases_inner.flush_required(&edit_bases_bytes) {
         flush_field_buffer(writer, file_meta, compressor, &mut bundle.edit_bases_inner, codec_map_required);
     }
     bundle.edit_bases_inner.write_data(&edit_bases_bytes);
-    (&mut idx_buf[..]).write_u32::<LittleEndian>(bundle.edit_bases_inner.offset as u32).unwrap();
-    bundle.edit_bases_idx_inner.write_data(&idx_buf);
 }
 
 // ---------------------------------------------------------------------------
