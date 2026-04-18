@@ -404,31 +404,27 @@ fn push_bundle_record<WS: Write + Seek>(
     (&mut idx_buf[..]).write_u32::<LittleEndian>(bundle.node_ids_inner.offset as u32).unwrap();
     bundle.node_ids_idx_inner.write_data(&idx_buf);
 
-    // EditOffsets (variable) + EditCounts index
-    // Raw fallback: no offsets stored (positions are implicit 0..seq_len).
-    let edit_offsets_bytes: Vec<u8> = if is_raw_fallback {
-        Vec::new()
-    } else {
-        entry.edits.iter().flat_map(|e| e.read_offset.to_le_bytes()).collect()
-    };
-    if bundle.edit_offsets_idx_inner.flush_required(&idx_buf) {
-        flush_field_buffer(writer, file_meta, compressor, &mut bundle.edit_offsets_idx_inner, codec_map_required);
-    }
-    if bundle.edit_offsets_inner.flush_required(&edit_offsets_bytes) {
-        flush_field_buffer(writer, file_meta, compressor, &mut bundle.edit_offsets_inner, codec_map_required);
-    }
-    bundle.edit_offsets_inner.write_data(&edit_offsets_bytes);
-    (&mut idx_buf[..]).write_u32::<LittleEndian>(bundle.edit_offsets_inner.offset as u32).unwrap();
-    bundle.edit_offsets_idx_inner.write_data(&idx_buf);
-
-    // EditBases (variable) - index derived from EditCounts / 4
-    // For graph-path reads: sparse edit bases.
-    // For raw fallback: all bases stored here directly.
+    // EditOffsets (variable) + EditCounts index + EditBases (variable)
+    // EditBases uses EditCounts/4 as index, so they must flush together to keep block boundaries aligned.
+    // We always store offsets (even for raw fallback) to maintain the 4:1 byte ratio between columns.
+    let edit_offsets_bytes: Vec<u8> = entry.edits.iter().flat_map(|e| e.read_offset.to_le_bytes()).collect();
     let edit_bases_bytes: Vec<u8> = entry.edits.iter().map(|e| e.read_base).collect();
-    if bundle.edit_bases_inner.flush_required(&edit_bases_bytes) {
+
+    // Flush both EditOffsets and EditBases together when either needs flushing
+    let needs_flush = bundle.edit_offsets_idx_inner.flush_required(&idx_buf)
+        || bundle.edit_offsets_inner.flush_required(&edit_offsets_bytes)
+        || bundle.edit_bases_inner.flush_required(&edit_bases_bytes);
+
+    if needs_flush {
+        flush_field_buffer(writer, file_meta, compressor, &mut bundle.edit_offsets_idx_inner, codec_map_required);
+        flush_field_buffer(writer, file_meta, compressor, &mut bundle.edit_offsets_inner, codec_map_required);
         flush_field_buffer(writer, file_meta, compressor, &mut bundle.edit_bases_inner, codec_map_required);
     }
+
+    bundle.edit_offsets_inner.write_data(&edit_offsets_bytes);
     bundle.edit_bases_inner.write_data(&edit_bases_bytes);
+    (&mut idx_buf[..]).write_u32::<LittleEndian>(bundle.edit_offsets_inner.offset as u32).unwrap();
+    bundle.edit_offsets_idx_inner.write_data(&idx_buf);
 }
 
 // ---------------------------------------------------------------------------
